@@ -1,0 +1,182 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default-deny catch-all to prevent unauthorized access
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Ping / connection health check
+    match /test/{docId} {
+      allow get: if true;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isDesignatedOwner() {
+      return isSignedIn() && (
+        request.auth.token.email == 'erickfeliz2026startup@gmail.com' ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'owner')
+      );
+    }
+
+    // Helper functions for entity validation
+    function isValidProperty(data) {
+      return data.keys().hasAll(['ownerUid', 'name', 'address', 'monthlyRentAmount', 'dueDay', 'leaseStartDate', 'active']) &&
+        data.ownerUid is string && data.ownerUid.size() <= 128 &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        data.address is string && data.address.size() >= 1 && data.address.size() <= 255 &&
+        data.monthlyRentAmount is int && data.monthlyRentAmount > 0 &&
+        data.dueDay is int && data.dueDay >= 1 && data.dueDay <= 31 &&
+        data.leaseStartDate is string && data.leaseStartDate.size() == 10 &&
+        data.active is bool;
+    }
+
+    function isValidTenant(data) {
+      return data.keys().hasAll(['ownerUid', 'fullName', 'phone', 'active']) &&
+        data.ownerUid is string && data.ownerUid.size() <= 128 &&
+        data.fullName is string && data.fullName.size() >= 2 && data.fullName.size() <= 120 &&
+        data.phone is string && data.phone.size() >= 7 && data.phone.size() <= 30 &&
+        data.active is bool;
+    }
+
+    function isValidPayment(data) {
+      return data.keys().hasAll(['ownerUid', 'propertyId', 'period', 'amountDue', 'dueDate', 'status']) &&
+        data.ownerUid is string && data.ownerUid.size() <= 128 &&
+        data.propertyId is string && data.propertyId.size() <= 128 &&
+        data.period is string && data.period.size() == 7 &&
+        data.amountDue is int && data.amountDue > 0 &&
+        data.dueDate is string && data.dueDate.size() == 10 &&
+        (data.status == 'pending' || data.status == 'paid');
+    }
+
+    function isValidReminderLog(data) {
+      return data.keys().hasAll(['ownerUid', 'paymentId', 'propertyId', 'period', 'recipient', 'scheduledFor', 'status', 'attempts']) &&
+        data.ownerUid is string && data.ownerUid.size() <= 128 &&
+        data.paymentId is string && data.paymentId.size() <= 128 &&
+        data.propertyId is string && data.propertyId.size() <= 128 &&
+        data.period is string && data.period.size() == 7 &&
+        data.recipient is string && data.recipient.size() <= 255 &&
+        data.scheduledFor is string && data.scheduledFor.size() == 10 &&
+        (data.status == 'processing' || data.status == 'sent' || data.status == 'failed') &&
+        data.attempts is int && data.attempts >= 0;
+    }
+
+    function isValidSetting(data) {
+      return data.keys().hasAll(['ownerUid', 'notificationEmail', 'timezone']) &&
+        data.ownerUid is string && data.ownerUid.size() <= 128 &&
+        data.notificationEmail is string && data.notificationEmail.size() <= 255 &&
+        data.timezone is string && data.timezone.size() <= 50;
+    }
+
+    // 1. Users collection
+    match /users/{userId} {
+      allow get: if isSignedIn() && request.auth.uid == userId;
+      allow list: if false;
+      allow create: if isSignedIn() && request.auth.uid == userId &&
+        (request.auth.token.email == 'erickfeliz2026startup@gmail.com') &&
+        incoming().uid == userId &&
+        incoming().role == 'owner' &&
+        incoming().email == request.auth.token.email;
+      allow update, delete: if false;
+    }
+
+    // 2. Properties collection
+    match /properties/{propertyId} {
+      allow get: if isDesignatedOwner() && isValidId(propertyId) && (resource == null || existing().ownerUid == request.auth.uid);
+      allow list: if isDesignatedOwner() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isDesignatedOwner() && isValidId(propertyId) &&
+        incoming().ownerUid == request.auth.uid &&
+        isValidProperty(incoming());
+      allow update: if isDesignatedOwner() && isValidId(propertyId) &&
+        existing().ownerUid == request.auth.uid &&
+        incoming().ownerUid == existing().ownerUid &&
+        isValidProperty(incoming()) &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['name', 'address', 'monthlyRentAmount', 'dueDay', 'tenantId', 'leaseStartDate', 'leaseEndDate', 'active', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // 3. Tenants collection
+    match /tenants/{tenantId} {
+      allow get: if isDesignatedOwner() && isValidId(tenantId) && (resource == null || existing().ownerUid == request.auth.uid);
+      allow list: if isDesignatedOwner() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isDesignatedOwner() && isValidId(tenantId) &&
+        incoming().ownerUid == request.auth.uid &&
+        isValidTenant(incoming());
+      allow update: if isDesignatedOwner() && isValidId(tenantId) &&
+        existing().ownerUid == request.auth.uid &&
+        incoming().ownerUid == existing().ownerUid &&
+        isValidTenant(incoming()) &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'phone', 'email', 'propertyId', 'notes', 'active', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // 4. Payments collection
+    match /payments/{paymentId} {
+      allow get: if isDesignatedOwner() && isValidId(paymentId) && (resource == null || existing().ownerUid == request.auth.uid);
+      allow list: if isDesignatedOwner() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isDesignatedOwner() && isValidId(paymentId) &&
+        incoming().ownerUid == request.auth.uid &&
+        isValidPayment(incoming());
+      allow update: if isDesignatedOwner() && isValidId(paymentId) &&
+        existing().ownerUid == request.auth.uid &&
+        incoming().ownerUid == existing().ownerUid &&
+        isValidPayment(incoming()) &&
+        (
+          // Action 1: Mark pending payment as paid
+          (existing().status == 'pending' &&
+           incoming().status == 'paid' &&
+           incoming().amountDue == existing().amountDue &&
+           incoming().dueDate == existing().dueDate &&
+           incoming().diff(existing()).affectedKeys().hasOnly(['status', 'paidAt', 'updatedAt']))
+        );
+      allow delete: if false;
+    }
+
+    // 5. Reminder logs collection
+    match /reminderLogs/{logId} {
+      allow get: if isDesignatedOwner() && isValidId(logId) && (resource == null || existing().ownerUid == request.auth.uid);
+      allow list: if isDesignatedOwner() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isDesignatedOwner() && isValidId(logId) &&
+        incoming().ownerUid == request.auth.uid &&
+        isValidReminderLog(incoming());
+      allow update: if isDesignatedOwner() && isValidId(logId) &&
+        existing().ownerUid == request.auth.uid &&
+        incoming().ownerUid == existing().ownerUid &&
+        isValidReminderLog(incoming()) &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['status', 'attempts', 'providerMessageId', 'lastError', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // 6. Settings collection
+    match /settings/{settingId} {
+      allow get: if isDesignatedOwner() && request.auth.uid == settingId;
+      allow list: if false;
+      allow create: if isDesignatedOwner() && request.auth.uid == settingId &&
+        incoming().ownerUid == request.auth.uid &&
+        isValidSetting(incoming());
+      allow update: if isDesignatedOwner() && request.auth.uid == settingId &&
+        existing().ownerUid == request.auth.uid &&
+        incoming().ownerUid == request.auth.uid &&
+        isValidSetting(incoming()) &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['notificationEmail', 'reminderHour', 'timezone', 'updatedAt']);
+      allow delete: if false;
+    }
+  }
+}

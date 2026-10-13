@@ -1,0 +1,6 @@
+{
+  "name": "Control de Alquileres",
+  "description": "Sistema de gestión de alquileres y recordatorios automatizados para propietarios en República Dominicana (DOP).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
