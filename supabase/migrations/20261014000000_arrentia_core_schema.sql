@@ -31,20 +31,57 @@ $$;
 
 -- Function: is_authorized_owner
 -- Validates if a user is an active authorized owner.
--- Uses SECURITY DEFINER with search_path = pg_catalog to prevent search path hijacking.
+-- Hardened against arbitrary UUID probing by authenticated clients.
+-- If called in an authenticated client context (auth.uid() is set / role = 'authenticated'),
+-- it only allows querying the caller's own ID (p_user_id = auth.uid()); queries for any
+-- other UUID immediately return false to prevent user enumeration.
+-- Administrative callers (service_role, postgres, internal procedures) remain unrestricted.
 CREATE OR REPLACE FUNCTION public.is_authorized_owner(p_user_id uuid)
 RETURNS boolean
-LANGUAGE sql
+LANGUAGE plpgsql
 SECURITY DEFINER
 STABLE
 SET search_path = pg_catalog
 AS $$
-  SELECT EXISTS (
+DECLARE
+  v_jwt_uid uuid;
+  v_jwt_role text;
+BEGIN
+  IF p_user_id IS NULL THEN
+    RETURN false;
+  END IF;
+
+  -- Extract JWT session claims safely
+  BEGIN
+    v_jwt_uid := NULLIF(pg_catalog.current_setting('request.jwt.claim.sub', true), '')::uuid;
+  EXCEPTION WHEN OTHERS THEN
+    v_jwt_uid := NULL;
+  END;
+
+  BEGIN
+    v_jwt_role := NULLIF(pg_catalog.current_setting('request.jwt.claim.role', true), '');
+  EXCEPTION WHEN OTHERS THEN
+    v_jwt_role := NULL;
+  END;
+
+  -- Enforce client-side probe protection:
+  -- Authenticated clients cannot probe whether other UUIDs are authorized owners.
+  -- Only self-checks (p_user_id = v_jwt_uid) are permitted when in authenticated user context.
+  -- Service_role and internal database callers are exempt from this restriction.
+  IF (v_jwt_role = 'authenticated' OR v_jwt_uid IS NOT NULL)
+     AND (v_jwt_role IS DISTINCT FROM 'service_role') THEN
+    IF v_jwt_uid IS NULL OR p_user_id IS DISTINCT FROM v_jwt_uid THEN
+      RETURN false;
+    END IF;
+  END IF;
+
+  RETURN EXISTS (
     SELECT 1
     FROM public.authorized_owners
     WHERE id = p_user_id
       AND is_active = true
   );
+END;
 $$;
 
 -- ----------------------------------------------------------------------------

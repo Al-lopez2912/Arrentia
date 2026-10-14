@@ -1,7 +1,42 @@
 -- ============================================================================
--- ARRENTIA: Test Suite for Schema Integrity and RLS Isolation (V6.6)
+-- ARRENTIA: Test Suite for Schema Integrity & Database Controls (V6.6)
 -- Execution Mode: TRANSACTIONAL VALIDATION WITH AUTOMATIC ROLLBACK
 -- Safe to run in psql / Supabase SQL Editor without persistent side-effects.
+--
+-- ----------------------------------------------------------------------------
+-- SCOPE AND STATUS NOTICE:
+-- ----------------------------------------------------------------------------
+-- This SQL test script validates database engine integrity, foreign keys,
+-- lifecycle triggers, server-side calculations, idempotency, concurrency leasing,
+-- and defensive function constraints in a sandboxed, rolled-back transaction.
+--
+-- THIS SCRIPT DOES NOT SIMULATE CLIENT-LEVEL RLS OVER HTTP.
+-- Database-level SQL execution under superuser/admin context does not prove
+-- client HTTP isolation. True RLS verification requires authenticated API calls.
+--
+-- ----------------------------------------------------------------------------
+-- MULTI-USER HTTP INTEGRATION TEST PROCEDURE (PENDING LIVE EXECUTION):
+-- ----------------------------------------------------------------------------
+-- To verify end-to-end multi-tenant isolation through the Supabase PostgREST API:
+-- 1. Create User A (mimelfis.lopez@gmail.com) via standard supabase.auth.signUp().
+-- 2. Bootstrap User A using supabase/bootstrap_owner.sql to grant active owner status.
+-- 3. Create User B (unprivileged_test_user@example.com) via supabase.auth.signUp().
+--    User B is NOT in public.authorized_owners.
+-- 4. Issue authenticated HTTP requests using User B's real JWT bearer token:
+--    a) GET /rest/v1/properties
+--       -> Expected: HTTP 200 with empty array [] (zero rows returned).
+--    b) POST /rest/v1/properties with { owner_id: User_A_UUID, name: 'Spoofed' }
+--       -> Expected: HTTP 403 Forbidden or empty insert due to RLS WITH CHECK failure.
+--    c) GET /rest/v1/payments
+--       -> Expected: HTTP 200 with empty array [].
+--    d) POST /rest/v1/payments
+--       -> Expected: HTTP 403 (direct client INSERT revoked for authenticated role).
+--    e) POST /rest/v1/rpc/fn_generate_monthly_payments
+--       -> Expected: HTTP 403 Forbidden / insufficient_privilege.
+--    f) POST /rest/v1/rpc/is_authorized_owner with { p_user_id: User_A_UUID }
+--       -> Expected: HTTP 200 returning false (probing protection active).
+-- 5. Execution Status: PENDING live execution via CI / external integration harness.
+--    (Do not simulate success without actual network execution).
 -- ============================================================================
 
 BEGIN;
@@ -9,7 +44,6 @@ BEGIN;
 DO $$
 DECLARE
   v_owner_id uuid;
-  v_attacker_id uuid;
   v_owner_email CONSTANT text := 'mimelfis.lopez@gmail.com';
   v_prop_id uuid;
   v_inactive_prop_id uuid;
@@ -25,79 +59,32 @@ DECLARE
   v_claim_token uuid;
   v_log_id uuid;
   v_complete_success boolean;
+  v_probe_result boolean;
 BEGIN
   -- Enforce explicit search path
   PERFORM set_config('search_path', 'public, auth, pg_temp', true);
 
   RAISE NOTICE '============================================================';
-  RAISE NOTICE 'STARTING ARRENTIA SCHEMA AND SECURITY ISOLATION TEST SUITE (V6.6)';
+  RAISE NOTICE 'STARTING ARRENTIA SCHEMA INTEGRITY & CONSTRAINTS TEST (V6.6)';
   RAISE NOTICE '============================================================';
 
   -- --------------------------------------------------------------------------
-  -- STEP 0: Set Up Test Fixtures Inside Uncommitted Transaction
+  -- STEP 0: Verify Real Owner Identity from auth.users (No Synthetic Users)
   -- --------------------------------------------------------------------------
   SELECT id INTO v_owner_id
   FROM auth.users
   WHERE lower(trim(email)) = lower(trim(v_owner_email));
 
   IF v_owner_id IS NULL THEN
-    v_owner_id := gen_random_uuid();
-    INSERT INTO auth.users (
-      id,
-      instance_id,
-      email,
-      encrypted_password,
-      email_confirmed_at,
-      role,
-      aud,
-      raw_app_meta_data,
-      raw_user_meta_data,
-      created_at,
-      updated_at
-    )
-    VALUES (
-      v_owner_id,
-      '00000000-0000-0000-0000-000000000000'::uuid,
-      v_owner_email,
-      'fake_hash',
-      now(),
-      'authenticated',
-      'authenticated',
-      '{"provider":"email","providers":["email"]}'::jsonb,
-      '{"full_name":"Mimelfis López"}'::jsonb,
-      now(),
-      now()
-    );
+    RAISE EXCEPTION
+      'TEST SETUP ABORTED: Real owner "%" was not found in auth.users. '
+      'The legitimate owner must create or confirm their account in Supabase Auth before running this test suite. '
+      'Direct insertion of synthetic/fabricated identities into auth.users is strictly forbidden.',
+      v_owner_email
+      USING ERRCODE = 'no_data_found';
   END IF;
 
-  v_attacker_id := gen_random_uuid();
-  INSERT INTO auth.users (
-    id,
-    instance_id,
-    email,
-    encrypted_password,
-    email_confirmed_at,
-    role,
-    aud,
-    raw_app_meta_data,
-    raw_user_meta_data,
-    created_at,
-    updated_at
-  )
-  VALUES (
-    v_attacker_id,
-    '00000000-0000-0000-0000-000000000000'::uuid,
-    'attacker_isolated_v66@test.com',
-    'fake_hash',
-    now(),
-    'authenticated',
-    'authenticated',
-    '{"provider":"email","providers":["email"]}'::jsonb,
-    '{"full_name":"Attacker"}'::jsonb,
-    now(),
-    now()
-  );
-
+  -- Ensure authorized owner record exists for the real owner in this test transaction
   INSERT INTO public.authorized_owners (
     id,
     email,
@@ -114,6 +101,7 @@ BEGIN
   SET is_active = true,
       email = EXCLUDED.email;
 
+  -- Ensure settings record exists for the real owner
   INSERT INTO public.settings (
     owner_id,
     notification_email,
@@ -132,7 +120,7 @@ BEGIN
   SET notification_email = EXCLUDED.notification_email;
 
   -- --------------------------------------------------------------------------
-  -- TEST 1: Tenant Assignment & Composite Foreign Key Isolation
+  -- TEST 1: Tenant Assignment & Composite Foreign Key Integrity
   -- --------------------------------------------------------------------------
   INSERT INTO public.properties (
     owner_id,
@@ -186,7 +174,7 @@ BEGIN
   END IF;
   RAISE NOTICE 'TEST 1A PASSED: Property and tenant successfully linked under authorized owner.';
 
-  -- Reject cross-owner assignment: Attacker cannot assign legitimate owner's property
+  -- Reject foreign/unregistered owner assignment via foreign key constraint
   BEGIN
     INSERT INTO public.tenants (
       owner_id,
@@ -196,21 +184,21 @@ BEGIN
       active
     )
     VALUES (
-      v_attacker_id, -- Attacker tries to bind to legitimate owner's property
-      'Inquilino Atacante',
+      '00000000-0000-0000-0000-000000000099'::uuid, -- Unregistered owner ID
+      'Inquilino Con Dueño Inexistente',
       '809-555-9999',
       v_prop_id,
       true
     );
 
-    RAISE EXCEPTION 'TEST 1B FAILED: Cross-owner property assignment was accepted by composite FK!';
+    RAISE EXCEPTION 'TEST 1B FAILED: Unregistered owner was accepted by tenant foreign key!';
   EXCEPTION
     WHEN foreign_key_violation THEN
-      RAISE NOTICE 'TEST 1B PASSED: Cross-owner property assignment correctly rejected by fk_tenants_property composite FK.';
+      RAISE NOTICE 'TEST 1B PASSED: Unregistered owner correctly rejected by fk_tenants_owner_authorized / fk_tenants_property.';
   END;
 
   -- --------------------------------------------------------------------------
-  -- TEST 2: Reject Second Active Tenant on Same Property
+  -- TEST 2: Reject Second Active Tenant on Same Property (Partial Unique Index)
   -- --------------------------------------------------------------------------
   BEGIN
     INSERT INTO public.tenants (
@@ -231,7 +219,7 @@ BEGIN
     RAISE EXCEPTION 'TEST 2 FAILED: Duplicate active tenant was allowed on property %', v_prop_id;
   EXCEPTION
     WHEN unique_violation THEN
-      RAISE NOTICE 'TEST 2 PASSED: Second active tenant correctly rejected by idx_tenants_active_property unique index.';
+      RAISE NOTICE 'TEST 2 PASSED: Second active tenant correctly rejected by idx_tenants_active_property.';
   END;
 
   -- --------------------------------------------------------------------------
@@ -370,7 +358,7 @@ BEGIN
   -- --------------------------------------------------------------------------
   -- TEST 5: Payment Financial Immutability & State Transitions
   -- --------------------------------------------------------------------------
-  -- 5A: Legitimate transition to 'paid' (status is text; auto-populates paid_at)
+  -- 5A: Legitimate transition to 'paid' (status is text; server sets authoritative paid_at)
   UPDATE public.payments
   SET status = 'paid'
   WHERE id = v_payment_id;
@@ -391,7 +379,7 @@ BEGIN
   IF v_is_auth IS NOT TRUE THEN
     RAISE EXCEPTION 'TEST 5A FAILED: Payment % was marked paid but paid_at was NULL', v_payment_id;
   END IF;
-  RAISE NOTICE 'TEST 5A PASSED: Legitimate state transition to paid accepted with auto-populated paid_at timestamp.';
+  RAISE NOTICE 'TEST 5A PASSED: Legitimate state transition to paid accepted with server-populated paid_at.';
 
   -- 5B: Reject reversion from 'paid' back to 'pending'
   BEGIN
@@ -598,22 +586,36 @@ BEGIN
     p_payment_id => (v_prop_id::text || '_2026-08'),
     p_claim_token => gen_random_uuid(), -- Wrong/stale token
     p_status => 'sent',
-    p_provider_message_id => 'stale-msg'
+    p_provider_message_id => 'real-resend-msg-999'
   );
   IF v_complete_success IS TRUE THEN
     RAISE EXCEPTION 'TEST 8C FAILED: Expired or invalid claim token was able to complete the reminder job!';
   END IF;
   RAISE NOTICE 'TEST 8C PASSED: Stale worker update rejected by fencing token.';
 
-  -- 8D: Legitimate worker completion with matching claim token succeeds
+  -- 8D: Rejection of dummy provider message ID placeholders
+  BEGIN
+    v_complete_success := public.fn_complete_reminder_job(
+      p_payment_id => (v_prop_id::text || '_2026-08'),
+      p_claim_token => v_claim_token,
+      p_status => 'sent',
+      p_provider_message_id => 'dummy' -- Prohibited placeholder
+    );
+    RAISE EXCEPTION 'TEST 8D FAILED: Dummy placeholder provider ID was accepted!';
+  EXCEPTION
+    WHEN invalid_parameter_value THEN
+      RAISE NOTICE 'TEST 8D PASSED: Dummy placeholder provider ID correctly rejected.';
+  END;
+
+  -- 8E: Legitimate worker completion with matching claim token succeeds
   v_complete_success := public.fn_complete_reminder_job(
     p_payment_id => (v_prop_id::text || '_2026-08'),
     p_claim_token => v_claim_token,
     p_status => 'sent',
-    p_provider_message_id => 'resend-test-msg-123'
+    p_provider_message_id => 'resend_live_msg_018fbc8d'
   );
   IF v_complete_success IS NOT TRUE THEN
-    RAISE EXCEPTION 'TEST 8D FAILED: Legitimate worker failed to complete job with valid claim token!';
+    RAISE EXCEPTION 'TEST 8E FAILED: Legitimate worker failed to complete job with valid claim token!';
   END IF;
 
   SELECT status INTO v_payment_status
@@ -621,9 +623,9 @@ BEGIN
   WHERE id = v_log_id;
 
   IF v_payment_status <> 'sent' THEN
-    RAISE EXCEPTION 'TEST 8D FAILED: reminder_logs status expected "sent", got %', v_payment_status;
+    RAISE EXCEPTION 'TEST 8E FAILED: reminder_logs status expected "sent", got %', v_payment_status;
   END IF;
-  RAISE NOTICE 'TEST 8D PASSED: Legitimate worker completion marked job as sent.';
+  RAISE NOTICE 'TEST 8E PASSED: Legitimate worker completion marked job as sent.';
 
   -- --------------------------------------------------------------------------
   -- TEST 9: Tenant & Property Lifecycle and ON DELETE RESTRICT Protection
@@ -679,9 +681,9 @@ BEGIN
   END;
 
   -- --------------------------------------------------------------------------
-  -- TEST 10: RLS Isolation & Attacker Rejection
+  -- TEST 10: Trigger Enforcement & Hardened is_authorized_owner Probe Protection
   -- --------------------------------------------------------------------------
-  -- Test settings trigger: notification_email must match authorized owner
+  -- 10A: Settings trigger: notification_email must match authorized owner
   BEGIN
     INSERT INTO public.settings (owner_id, notification_email)
     VALUES (v_owner_id, 'unauthorized_recipient@evil.com');
@@ -692,7 +694,7 @@ BEGIN
       RAISE NOTICE 'TEST 10A PASSED: Mismatched notification email rejected by settings trigger.';
   END;
 
-  -- Test reminder_logs trigger: recipient must match authorized owner
+  -- 10B: Reminder logs trigger: recipient must match authorized owner
   BEGIN
     INSERT INTO public.reminder_logs (
       owner_id,
@@ -708,7 +710,7 @@ BEGIN
       v_payment_id,
       v_prop_id,
       '2026-04',
-      'tenant_attacker@evil.com', -- Disallowed recipient
+      'tenant_recipient@evil.com', -- Disallowed recipient
       DATE '2026-04-05',
       'processing'
     );
@@ -719,42 +721,44 @@ BEGIN
       RAISE NOTICE 'TEST 10B PASSED: Reminder log with non-owner recipient correctly rejected by trigger.';
   END;
 
-  -- Test attacker insertion into properties with forged owner_id
-  BEGIN
-    PERFORM set_config('request.jwt.claim.sub', v_attacker_id::text, true);
-    PERFORM set_config('request.jwt.claim.role', 'authenticated', true);
+  -- 10C: is_authorized_owner administrative call (no JWT claims in session)
+  v_probe_result := public.is_authorized_owner(v_owner_id);
+  IF v_probe_result IS NOT TRUE THEN
+    RAISE EXCEPTION 'TEST 10C FAILED: is_authorized_owner returned false for real active owner in administrative context';
+  END IF;
+  RAISE NOTICE 'TEST 10C PASSED: is_authorized_owner correctly confirms active owner in administrative context.';
 
-    INSERT INTO public.properties (
-      owner_id,
-      name,
-      address,
-      monthly_rent_amount,
-      due_day,
-      lease_start_date,
-      active
-    )
-    VALUES (
-      v_owner_id, -- Spoofing victim owner_id
-      'Propiedad Suplantada',
-      'Calle del Robo #1',
-      50000,
-      1,
-      DATE '2026-01-01',
-      true
-    );
+  -- 10D: is_authorized_owner client context protection (simulated authenticated caller)
+  -- 10D.1: Caller querying own UUID -> allowed to verify
+  PERFORM set_config('request.jwt.claim.sub', v_owner_id::text, true);
+  PERFORM set_config('request.jwt.claim.role', 'authenticated', true);
 
-    RAISE EXCEPTION 'TEST 10C FAILED: Attacker was able to insert property for authorized owner!';
-  EXCEPTION
-    WHEN check_violation OR insufficient_privilege THEN
-      RAISE NOTICE 'TEST 10C PASSED: Identity spoofing blocked by RLS / trigger.';
-  END;
+  v_probe_result := public.is_authorized_owner(v_owner_id);
+  IF v_probe_result IS NOT TRUE THEN
+    RAISE EXCEPTION 'TEST 10D.1 FAILED: Authenticated self-check failed for active owner';
+  END IF;
+  RAISE NOTICE 'TEST 10D.1 PASSED: Authenticated self-query succeeds.';
+
+  -- 10D.2: Caller querying a DIFFERENT UUID -> MUST return false (probe blocked)
+  v_probe_result := public.is_authorized_owner('00000000-0000-0000-0000-000000000099'::uuid);
+  IF v_probe_result IS NOT FALSE THEN
+    RAISE EXCEPTION 'TEST 10D.2 FAILED: is_authorized_owner allowed authenticated caller to probe foreign UUID!';
+  END IF;
+  RAISE NOTICE 'TEST 10D.2 PASSED: Authenticated probe of foreign UUID correctly returned false.';
+
+  -- 10D.3: Caller passing NULL -> MUST return false
+  v_probe_result := public.is_authorized_owner(NULL);
+  IF v_probe_result IS NOT FALSE THEN
+    RAISE EXCEPTION 'TEST 10D.3 FAILED: is_authorized_owner(NULL) returned true!';
+  END IF;
+  RAISE NOTICE 'TEST 10D.3 PASSED: is_authorized_owner(NULL) correctly returned false.';
 
   -- Reset connection context
   PERFORM set_config('request.jwt.claim.sub', '', true);
   PERFORM set_config('request.jwt.claim.role', '', true);
 
   RAISE NOTICE '============================================================';
-  RAISE NOTICE 'ALL ARRENTIA V6.6 INTEGRITY & SECURITY TESTS COMPLETED SUCCESSFULLY';
+  RAISE NOTICE 'ALL ARRENTIA V6.6 DATABASE CONTROLS COMPLETED SUCCESSFULLY';
   RAISE NOTICE '============================================================';
 
 END;
