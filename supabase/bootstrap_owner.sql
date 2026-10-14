@@ -1,5 +1,5 @@
 -- ============================================================================
--- ARRENTIA: Authorized Owner Bootstrap Procedure (V6.1)
+-- ARRENTIA: Authorized Owner Bootstrap Procedure (V6.2)
 -- Target Owner: mimelfis.lopez@gmail.com
 -- Idempotent, safe, and checks real auth.users identity without synthetic UUIDs.
 -- ============================================================================
@@ -45,10 +45,26 @@ BEGIN
   WHERE lower(trim(email)) = lower(trim(v_test_account_email))
      OR (lower(trim(email)) <> lower(trim(v_target_email)) AND is_active = true);
 
-  -- 4. Clean up any obsolete record with the target email but obsolete UUID
-  DELETE FROM public.authorized_owners
-  WHERE lower(trim(email)) = lower(trim(v_target_email))
-    AND id <> v_user_id;
+  -- 4. If an obsolete record exists with the target email but different UUID, migrate data safely
+  IF EXISTS (
+    SELECT 1 FROM public.authorized_owners
+    WHERE lower(trim(email)) = lower(trim(v_target_email)) AND id <> v_user_id
+  ) THEN
+    UPDATE public.properties SET owner_id = v_user_id WHERE owner_id IN (
+      SELECT id FROM public.authorized_owners WHERE lower(trim(email)) = lower(trim(v_target_email)) AND id <> v_user_id
+    );
+    UPDATE public.tenants SET owner_id = v_user_id WHERE owner_id IN (
+      SELECT id FROM public.authorized_owners WHERE lower(trim(email)) = lower(trim(v_target_email)) AND id <> v_user_id
+    );
+    UPDATE public.payments SET owner_id = v_user_id WHERE owner_id IN (
+      SELECT id FROM public.authorized_owners WHERE lower(trim(email)) = lower(trim(v_target_email)) AND id <> v_user_id
+    );
+    UPDATE public.settings SET owner_id = v_user_id WHERE owner_id IN (
+      SELECT id FROM public.authorized_owners WHERE lower(trim(email)) = lower(trim(v_target_email)) AND id <> v_user_id
+    );
+    DELETE FROM public.authorized_owners
+    WHERE lower(trim(email)) = lower(trim(v_target_email)) AND id <> v_user_id;
+  END IF;
 
   -- 5. Register or activate the legitimate owner in public.authorized_owners
   INSERT INTO public.authorized_owners (

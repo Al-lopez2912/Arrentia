@@ -1,15 +1,16 @@
 -- ============================================================================
--- ARRENTIA: Core PostgreSQL / Supabase Schema Migration (Phase A - V6.1)
+-- ARRENTIA: Core PostgreSQL / Supabase Schema Migration (Phase A - V6.2)
 -- Version: 20261014000000
 -- Description: Core 5-table + authorized_owners architecture with strict RLS,
 --              composite foreign keys (tenant/property/owner), canonical payment IDs,
---              financial immutability triggers, and reminder worker isolation.
+--              financial immutability triggers, reminder worker isolation, and
+--              anti-probe authorization protection.
 -- ============================================================================
 
 -- Ensure pgcrypto extension is available for UUID generation
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
--- Ensure standard Supabase roles exist (supports local / CI PostgreSQL instances)
+-- Ensure standard Supabase roles exist (safely handled for local / CI environments)
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
@@ -21,35 +22,70 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
     CREATE ROLE service_role NOLOGIN;
   END IF;
+EXCEPTION
+  WHEN duplicate_object OR insufficient_privilege THEN
+    NULL;
 END;
 $$;
 
--- Ensure auth schema and auth.users stub exist if running in non-Supabase CI
-CREATE SCHEMA IF NOT EXISTS auth;
-CREATE TABLE IF NOT EXISTS auth.users (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  instance_id uuid,
-  email text UNIQUE,
-  encrypted_password text,
-  email_confirmed_at timestamptz,
-  role text DEFAULT 'authenticated',
-  aud text DEFAULT 'authenticated',
-  raw_app_meta_data jsonb DEFAULT '{}'::jsonb,
-  raw_user_meta_data jsonb DEFAULT '{}'::jsonb,
-  created_at timestamptz DEFAULT now(),
-  updated_at timestamptz DEFAULT now()
-);
+-- Safely ensure auth schema and auth.users stub exist only if missing (e.g. non-Supabase CI)
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'auth') THEN
+    CREATE SCHEMA auth;
+  END IF;
+EXCEPTION
+  WHEN insufficient_privilege OR duplicate_schema THEN
+    NULL;
+END;
+$$;
 
--- Ensure auth.uid() helper is present
-CREATE OR REPLACE FUNCTION auth.uid()
-RETURNS uuid
-LANGUAGE sql
-STABLE
-AS $$
-  SELECT coalesce(
-    nullif(current_setting('request.jwt.claim.sub', true), ''),
-    ((nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub'))
-  )::uuid;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'auth' AND tablename = 'users') THEN
+    CREATE TABLE auth.users (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      instance_id uuid,
+      email text UNIQUE,
+      encrypted_password text,
+      email_confirmed_at timestamptz,
+      role text DEFAULT 'authenticated',
+      aud text DEFAULT 'authenticated',
+      raw_app_meta_data jsonb DEFAULT '{}'::jsonb,
+      raw_user_meta_data jsonb DEFAULT '{}'::jsonb,
+      created_at timestamptz DEFAULT now(),
+      updated_at timestamptz DEFAULT now()
+    );
+  END IF;
+EXCEPTION
+  WHEN insufficient_privilege OR duplicate_table THEN
+    NULL;
+END;
+$$;
+
+-- Ensure auth.uid() helper is present if not already natively defined by Supabase
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_proc p
+    JOIN pg_namespace n ON p.pronamespace = n.oid
+    WHERE n.nspname = 'auth' AND p.proname = 'uid'
+  ) THEN
+    CREATE FUNCTION auth.uid()
+    RETURNS uuid
+    LANGUAGE sql
+    STABLE
+    AS $func$
+      SELECT coalesce(
+        nullif(current_setting('request.jwt.claim.sub', true), ''),
+        ((nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub'))
+      )::uuid;
+    $func$;
+  END IF;
+EXCEPTION
+  WHEN insufficient_privilege OR duplicate_function THEN
+    NULL;
+END;
 $$;
 
 -- ----------------------------------------------------------------------------
@@ -73,6 +109,7 @@ COMMENT ON TABLE public.authorized_owners IS 'Administrative authorization regis
 -- 2. Authorization Helper Function: is_authorized_owner
 -- Checks whether a given user UUID is an active authorized owner.
 -- Hardened against user probing: authenticated clients can only check their own UID.
+-- Unauthenticated callers (anon) cannot probe any user IDs.
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.is_authorized_owner(p_user_id uuid DEFAULT auth.uid())
 RETURNS boolean
@@ -81,16 +118,37 @@ SECURITY DEFINER
 STABLE
 SET search_path = public, pg_temp
 AS $$
+DECLARE
+  v_calling_uid uuid;
+  v_jwt_role text;
 BEGIN
+  -- If no target user ID provided, evaluate as unauthorized
   IF p_user_id IS NULL THEN
     RETURN false;
   END IF;
 
-  -- Anti-probe safeguard: authenticated browser clients can only inspect their own authorization
-  IF current_user = 'authenticated' AND p_user_id IS DISTINCT FROM auth.uid() THEN
+  -- Inspect calling context
+  v_calling_uid := auth.uid();
+  v_jwt_role := coalesce(
+    nullif(current_setting('request.jwt.claim.role', true), ''),
+    ((nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'))
+  );
+
+  -- 1. Anti-probe safeguard for authenticated browser clients:
+  -- If invoked by an authenticated user, they may ONLY inspect their own authorization status.
+  IF (v_calling_uid IS NOT NULL OR v_jwt_role = 'authenticated') THEN
+    IF v_calling_uid IS NULL OR p_user_id IS DISTINCT FROM v_calling_uid THEN
+      RETURN false;
+    END IF;
+  END IF;
+
+  -- 2. Anti-probe safeguard for anonymous callers:
+  -- Anonymous public requests cannot inspect any user IDs.
+  IF v_jwt_role = 'anon' THEN
     RETURN false;
   END IF;
 
+  -- 3. Query the authorization registry (service_role, postgres, or verified self-check)
   RETURN EXISTS (
     SELECT 1
     FROM public.authorized_owners
@@ -100,7 +158,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION public.is_authorized_owner(uuid) IS 'Evaluates whether a user UUID is listed as an active authorized owner.';
+COMMENT ON FUNCTION public.is_authorized_owner(uuid) IS 'Evaluates whether a user UUID is listed as an active authorized owner with anti-probing defense.';
 
 -- ----------------------------------------------------------------------------
 -- 3. Utility Function: set_updated_at
@@ -284,7 +342,7 @@ CREATE TABLE IF NOT EXISTS public.payments (
   CONSTRAINT payments_due_date_period_match CHECK (to_char(due_date, 'YYYY-MM') = period),
   CONSTRAINT fk_payments_owner_authorized FOREIGN KEY (owner_id) REFERENCES public.authorized_owners(id) ON DELETE CASCADE,
   CONSTRAINT fk_payments_property_owner FOREIGN KEY (property_id, owner_id) REFERENCES public.properties(id, owner_id) ON DELETE RESTRICT,
-  CONSTRAINT fk_payments_tenant_owner FOREIGN KEY (tenant_id, owner_id) REFERENCES public.tenants(id, owner_id) ON DELETE SET NULL,
+  CONSTRAINT fk_payments_tenant_owner FOREIGN KEY (tenant_id, owner_id) REFERENCES public.tenants(id, owner_id) ON DELETE RESTRICT,
   CONSTRAINT payments_paid_status_check CHECK (
     (status = 'paid' AND paid_at IS NOT NULL) OR
     (status = 'pending')
@@ -323,7 +381,7 @@ BEFORE INSERT OR UPDATE OF id, property_id, period ON public.payments
 FOR EACH ROW
 EXECUTE FUNCTION public.trg_payments_enforce_canonical_id();
 
--- Reject payment creation for archived/inactive properties
+-- Reject payment creation for archived/inactive properties and cross-owner inconsistencies
 CREATE OR REPLACE FUNCTION public.trg_payments_reject_inactive_property()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -332,9 +390,10 @@ SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_property_active boolean;
+  v_property_owner uuid;
 BEGIN
   IF TG_OP = 'INSERT' OR (TG_OP = 'UPDATE' AND NEW.property_id <> OLD.property_id) THEN
-    SELECT active INTO v_property_active
+    SELECT active, owner_id INTO v_property_active, v_property_owner
     FROM public.properties
     WHERE id = NEW.property_id;
 
@@ -343,8 +402,24 @@ BEGIN
         USING ERRCODE = 'foreign_key_violation';
     END IF;
 
+    IF v_property_owner <> NEW.owner_id THEN
+      RAISE EXCEPTION 'Property % does not belong to owner %', NEW.property_id, NEW.owner_id
+        USING ERRCODE = 'check_violation';
+    END IF;
+
     IF v_property_active = false THEN
       RAISE EXCEPTION 'Cannot create payment for inactive property %', NEW.property_id
+        USING ERRCODE = 'check_violation';
+    END IF;
+  END IF;
+
+  -- Validate tenant ownership if tenant_id is specified
+  IF NEW.tenant_id IS NOT NULL THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM public.tenants
+      WHERE id = NEW.tenant_id AND owner_id = NEW.owner_id
+    ) THEN
+      RAISE EXCEPTION 'Tenant % does not belong to owner %', NEW.tenant_id, NEW.owner_id
         USING ERRCODE = 'check_violation';
     END IF;
   END IF;
@@ -355,7 +430,7 @@ $$;
 
 DROP TRIGGER IF EXISTS trg_payments_check_active_property ON public.payments;
 CREATE TRIGGER trg_payments_check_active_property
-BEFORE INSERT OR UPDATE OF property_id ON public.payments
+BEFORE INSERT OR UPDATE OF property_id, tenant_id ON public.payments
 FOR EACH ROW
 EXECUTE FUNCTION public.trg_payments_reject_inactive_property();
 
@@ -372,24 +447,33 @@ BEGIN
       USING ERRCODE = 'check_violation';
   END IF;
 
-  -- 2. State transition protection: cannot revert from 'paid' back to 'pending'
+  -- 2. Financial fields cannot be modified once payment is generated (matches firestore.rules immutability)
+  IF NEW.amount_due <> OLD.amount_due THEN
+    RAISE EXCEPTION 'Payment amount_due is immutable and cannot be modified'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF NEW.due_date <> OLD.due_date THEN
+    RAISE EXCEPTION 'Payment due_date is immutable and cannot be modified'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  -- 3. State transition protection: cannot revert from 'paid' back to 'pending'
   IF OLD.status = 'paid' AND NEW.status <> 'paid' THEN
     RAISE EXCEPTION 'Illegal state transition: paid payments cannot be reverted to pending'
       USING ERRCODE = 'check_violation';
   END IF;
 
-  -- 3. Immutability of paid payments: financial amount, due date, paid_at and tenant cannot be altered
+  -- 4. Immutability of paid payments: tenant and paid_at cannot be altered once paid
   IF OLD.status = 'paid' THEN
-    IF NEW.amount_due <> OLD.amount_due OR
-       NEW.due_date <> OLD.due_date OR
-       NEW.paid_at IS DISTINCT FROM OLD.paid_at OR
+    IF NEW.paid_at IS DISTINCT FROM OLD.paid_at OR
        NEW.tenant_id IS DISTINCT FROM OLD.tenant_id THEN
       RAISE EXCEPTION 'Paid payments are immutable and cannot be modified'
         USING ERRCODE = 'check_violation';
     END IF;
   END IF;
 
-  -- 4. When marking as paid, ensure paid_at is populated
+  -- 5. When marking as paid, ensure paid_at is populated
   IF OLD.status = 'pending' AND NEW.status = 'paid' THEN
     IF NEW.paid_at IS NULL THEN
       NEW.paid_at := now();
@@ -491,6 +575,7 @@ EXECUTE FUNCTION public.trg_sync_owner_email_to_settings();
 -- ----------------------------------------------------------------------------
 -- 9. Table: reminder_logs
 -- Audit log of sent reminder emails. Written exclusively by backend/worker.
+-- Reminders go strictly to the authorized owner, never to tenants.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.reminder_logs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -512,6 +597,41 @@ CREATE INDEX IF NOT EXISTS idx_reminder_logs_owner_id ON public.reminder_logs (o
 CREATE INDEX IF NOT EXISTS idx_reminder_logs_payment_id ON public.reminder_logs (payment_id);
 CREATE INDEX IF NOT EXISTS idx_reminder_logs_status ON public.reminder_logs (status);
 CREATE INDEX IF NOT EXISTS idx_reminder_logs_scheduled_for ON public.reminder_logs (scheduled_for);
+
+-- Enforce that reminder recipient is strictly the authorized owner's notification email
+CREATE OR REPLACE FUNCTION public.trg_reminder_logs_enforce_owner_recipient()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_owner_email text;
+BEGIN
+  SELECT email INTO v_owner_email
+  FROM public.authorized_owners
+  WHERE id = NEW.owner_id AND is_active = true;
+
+  IF v_owner_email IS NULL THEN
+    RAISE EXCEPTION 'Reminder logs can only be created for an active authorized owner.'
+      USING ERRCODE = 'foreign_key_violation';
+  END IF;
+
+  IF lower(trim(NEW.recipient)) <> lower(trim(v_owner_email)) THEN
+    RAISE EXCEPTION 'Security violation: Reminders can only be dispatched to the authorized owner (%), not to tenant or third party (%)',
+      v_owner_email, NEW.recipient
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_reminder_logs_enforce_recipient ON public.reminder_logs;
+CREATE TRIGGER trg_reminder_logs_enforce_recipient
+BEFORE INSERT OR UPDATE OF owner_id, recipient ON public.reminder_logs
+FOR EACH ROW
+EXECUTE FUNCTION public.trg_reminder_logs_enforce_owner_recipient();
 
 -- ----------------------------------------------------------------------------
 -- 10. Updated_At Triggers for All Tables
@@ -669,13 +789,13 @@ USING (owner_id = auth.uid() AND public.is_authorized_owner(auth.uid()));
 -- ----------------------------------------------------------------------------
 -- 12. Granular Permissions (Principle of Least Privilege)
 -- ----------------------------------------------------------------------------
--- Revoke all table privileges from unauthenticated (anon) users
-REVOKE ALL ON TABLE public.authorized_owners FROM anon;
-REVOKE ALL ON TABLE public.properties FROM anon;
-REVOKE ALL ON TABLE public.tenants FROM anon;
-REVOKE ALL ON TABLE public.payments FROM anon;
-REVOKE ALL ON TABLE public.settings FROM anon;
-REVOKE ALL ON TABLE public.reminder_logs FROM anon;
+-- Revoke all table privileges from unauthenticated (anon) users and PUBLIC
+REVOKE ALL ON TABLE public.authorized_owners FROM anon, PUBLIC;
+REVOKE ALL ON TABLE public.properties FROM anon, PUBLIC;
+REVOKE ALL ON TABLE public.tenants FROM anon, PUBLIC;
+REVOKE ALL ON TABLE public.payments FROM anon, PUBLIC;
+REVOKE ALL ON TABLE public.settings FROM anon, PUBLIC;
+REVOKE ALL ON TABLE public.reminder_logs FROM anon, PUBLIC;
 
 -- Authenticated clients:
 -- Can read authorized_owners to determine role
@@ -693,6 +813,17 @@ GRANT SELECT ON public.reminder_logs TO authenticated;
 -- Helper function permissions
 GRANT EXECUTE ON FUNCTION public.is_authorized_owner(uuid) TO authenticated, service_role;
 REVOKE EXECUTE ON FUNCTION public.is_authorized_owner(uuid) FROM anon, PUBLIC;
+
+-- Internal trigger functions: revoke direct execute from anon and PUBLIC
+REVOKE EXECUTE ON FUNCTION public.trg_set_updated_at() FROM anon, PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.trg_tenant_lifecycle() FROM anon, PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.trg_property_lifecycle() FROM anon, PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.trg_payments_enforce_canonical_id() FROM anon, PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.trg_payments_reject_inactive_property() FROM anon, PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.trg_payments_enforce_immutability() FROM anon, PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.trg_settings_enforce_owner_email() FROM anon, PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.trg_sync_owner_email_to_settings() FROM anon, PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.trg_reminder_logs_enforce_owner_recipient() FROM anon, PUBLIC;
 
 -- Service role maintains full access for administrative operations and background workers
 GRANT ALL ON TABLE public.authorized_owners TO service_role;

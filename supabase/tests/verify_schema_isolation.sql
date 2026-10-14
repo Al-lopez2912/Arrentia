@@ -1,5 +1,5 @@
 -- ============================================================================
--- ARRENTIA: Test Suite for Schema Integrity and RLS Isolation (V6.1)
+-- ARRENTIA: Test Suite for Schema Integrity and RLS Isolation (V6.2)
 -- Execution Mode: TRANSACTIONAL VALIDATION WITH AUTOMATIC ROLLBACK
 -- Safe to run in psql / Supabase SQL Editor without persistent side-effects.
 -- ============================================================================
@@ -24,7 +24,7 @@ BEGIN
   PERFORM set_config('search_path', 'public, auth, pg_temp', true);
 
   RAISE NOTICE '============================================================';
-  RAISE NOTICE 'STARTING ARRENTIA SCHEMA AND SECURITY ISOLATION TEST SUITE (V6.1)';
+  RAISE NOTICE 'STARTING ARRENTIA SCHEMA AND SECURITY ISOLATION TEST SUITE (V6.2)';
   RAISE NOTICE '============================================================';
 
   -- --------------------------------------------------------------------------
@@ -335,16 +335,16 @@ BEGIN
       RAISE NOTICE 'TEST 5B PASSED: Illegal transition from paid to pending rejected by trigger.';
   END;
 
-  -- 5C: Reject altering amount_due on paid payment (Financial Tampering)
+  -- 5C: Reject altering amount_due on payment (Financial Tampering)
   BEGIN
     UPDATE public.payments
     SET amount_due = 5000
     WHERE id = v_payment_id;
 
-    RAISE EXCEPTION 'TEST 5C FAILED: Paid payment amount_due was altered!';
+    RAISE EXCEPTION 'TEST 5C FAILED: Payment amount_due was altered!';
   EXCEPTION
     WHEN check_violation THEN
-      RAISE NOTICE 'TEST 5C PASSED: Altering amount_due on paid payment rejected by trigger.';
+      RAISE NOTICE 'TEST 5C PASSED: Altering amount_due on payment rejected by trigger.';
   END;
 
   -- 5D: Reject altering immutable identity fields (property_id / period)
@@ -394,7 +394,6 @@ BEGIN
     SET property_id = v_prop_id
     WHERE id = v_tenant_id;
 
-    -- The trigger clears it to null if active=false, or check constraint blocks it
     SELECT property_id INTO v_retrieved_prop_id FROM public.tenants WHERE id = v_tenant_id;
     IF v_retrieved_prop_id IS NOT NULL THEN
       RAISE EXCEPTION 'TEST 6B FAILED: Inactive tenant held an assigned property!';
@@ -456,10 +455,40 @@ BEGIN
   END;
 
   -- --------------------------------------------------------------------------
-  -- TEST 9: RLS Isolation with Real Execution Context (SET LOCAL ROLE authenticated)
+  -- TEST 9: Reminder Logs Recipient Enforcement
   -- --------------------------------------------------------------------------
-  -- 9A: Positive check — Authorized Owner has full RLS read access
+  BEGIN
+    INSERT INTO public.reminder_logs (
+      owner_id,
+      payment_id,
+      property_id,
+      period,
+      recipient,
+      scheduled_for,
+      status
+    )
+    VALUES (
+      v_owner_id,
+      v_payment_id,
+      v_prop_id,
+      '2026-04',
+      'tenant_unauthorized@example.com',
+      DATE '2026-04-05',
+      'processing'
+    );
+
+    RAISE EXCEPTION 'TEST 9 FAILED: Reminder log allowed dispatch to tenant instead of owner!';
+  EXCEPTION
+    WHEN check_violation THEN
+      RAISE NOTICE 'TEST 9 PASSED: Non-owner reminder recipient correctly rejected by trigger.';
+  END;
+
+  -- --------------------------------------------------------------------------
+  -- TEST 10: RLS Isolation with Real Execution Context (SET LOCAL ROLE authenticated)
+  -- --------------------------------------------------------------------------
+  -- 10A: Positive check — Authorized Owner has full RLS read access
   PERFORM set_config('request.jwt.claim.sub', v_owner_id::text, true);
+  PERFORM set_config('request.jwt.claim.role', 'authenticated', true);
   PERFORM set_config('request.jwt.claims', json_build_object('sub', v_owner_id::text, 'role', 'authenticated')::text, true);
   EXECUTE 'SET LOCAL ROLE authenticated';
 
@@ -467,23 +496,24 @@ BEGIN
   FROM public.properties;
 
   IF v_count = 0 THEN
-    RAISE EXCEPTION 'TEST 9A FAILED: Authorized owner could not read own properties under RLS!';
+    RAISE EXCEPTION 'TEST 10A FAILED: Authorized owner could not read own properties under RLS!';
   END IF;
-  RAISE NOTICE 'TEST 9A PASSED: Authorized owner correctly reads % properties under RLS.', v_count;
+  RAISE NOTICE 'TEST 10A PASSED: Authorized owner correctly reads % properties under RLS.', v_count;
 
-  -- 9B: Negative check — Unauthorized User reads 0 rows under RLS
+  -- 10B: Negative check — Unauthorized User reads 0 rows under RLS
   PERFORM set_config('request.jwt.claim.sub', v_attacker_id::text, true);
+  PERFORM set_config('request.jwt.claim.role', 'authenticated', true);
   PERFORM set_config('request.jwt.claims', json_build_object('sub', v_attacker_id::text, 'role', 'authenticated')::text, true);
 
   SELECT COUNT(*) INTO v_count
   FROM public.properties;
 
   IF v_count <> 0 THEN
-    RAISE EXCEPTION 'TEST 9B FAILED: Unauthorized user read % property records through RLS!', v_count;
+    RAISE EXCEPTION 'TEST 10B FAILED: Unauthorized user read % property records through RLS!', v_count;
   END IF;
-  RAISE NOTICE 'TEST 9B PASSED: Unauthorized user cannot read properties (0 records returned under RLS).';
+  RAISE NOTICE 'TEST 10B PASSED: Unauthorized user cannot read properties (0 records returned under RLS).';
 
-  -- 9C: Negative check — Unauthorized User cannot insert records
+  -- 10C: Negative check — Unauthorized User cannot insert records
   BEGIN
     INSERT INTO public.properties (
       owner_id,
@@ -502,26 +532,27 @@ BEGIN
       DATE '2026-06-01'
     );
 
-    RAISE EXCEPTION 'TEST 9C FAILED: Unauthorized user was able to insert a property!';
+    RAISE EXCEPTION 'TEST 10C FAILED: Unauthorized user was able to insert a property!';
   EXCEPTION
     WHEN insufficient_privilege OR check_violation OR integrity_constraint_violation THEN
-      RAISE NOTICE 'TEST 9C PASSED: Unauthorized user insert rejected by RLS / authorization check.';
+      RAISE NOTICE 'TEST 10C PASSED: Unauthorized user insert rejected by RLS / authorization check.';
   END;
 
-  -- 9D: Anti-probe check — Unauthorized user calling is_authorized_owner with victim UUID returns false
+  -- 10D: Anti-probe check — Unauthorized user calling is_authorized_owner with victim UUID returns false
   SELECT public.is_authorized_owner(v_owner_id) INTO v_is_auth;
   IF v_is_auth = true THEN
-    RAISE EXCEPTION 'TEST 9D FAILED: Attacker was able to probe authorization of another user!';
+    RAISE EXCEPTION 'TEST 10D FAILED: Attacker was able to probe authorization of another user!';
   END IF;
-  RAISE NOTICE 'TEST 9D PASSED: Anti-probe rule blocked unauthorized user from checking another UUID.';
+  RAISE NOTICE 'TEST 10D PASSED: Anti-probe rule blocked unauthorized user from checking another UUID.';
 
   -- Reset role and claims back to administrative session
   EXECUTE 'RESET ROLE';
   PERFORM set_config('request.jwt.claim.sub', '', true);
+  PERFORM set_config('request.jwt.claim.role', '', true);
   PERFORM set_config('request.jwt.claims', '', true);
 
   RAISE NOTICE '============================================================';
-  RAISE NOTICE 'ALL 9 INTEGRITY AND SECURITY TESTS COMPLETED SUCCESSFULLY!';
+  RAISE NOTICE 'ALL 10 INTEGRITY AND SECURITY TESTS COMPLETED SUCCESSFULLY!';
   RAISE NOTICE '============================================================';
 END;
 $$;
