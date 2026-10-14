@@ -1,5 +1,5 @@
 -- ============================================================================
--- ARRENTIA: Test Suite for Schema Integrity and RLS Isolation (V6.2)
+-- ARRENTIA: Test Suite for Schema Integrity and RLS Isolation (V6.3)
 -- Execution Mode: TRANSACTIONAL VALIDATION WITH AUTOMATIC ROLLBACK
 -- Safe to run in psql / Supabase SQL Editor without persistent side-effects.
 -- ============================================================================
@@ -24,7 +24,7 @@ BEGIN
   PERFORM set_config('search_path', 'public, auth, pg_temp', true);
 
   RAISE NOTICE '============================================================';
-  RAISE NOTICE 'STARTING ARRENTIA SCHEMA AND SECURITY ISOLATION TEST SUITE (V6.2)';
+  RAISE NOTICE 'STARTING ARRENTIA SCHEMA AND SECURITY ISOLATION TEST SUITE (V6.3)';
   RAISE NOTICE '============================================================';
 
   -- --------------------------------------------------------------------------
@@ -65,7 +65,7 @@ BEGIN
     );
   END IF;
 
-  -- Create unauthorized test attacker user in auth.users
+  -- Create unauthorized test attacker user in auth.users with non-colliding email
   v_attacker_id := gen_random_uuid();
   INSERT INTO auth.users (
     id,
@@ -83,7 +83,7 @@ BEGIN
   VALUES (
     v_attacker_id,
     '00000000-0000-0000-0000-000000000000'::uuid,
-    'unauthorized_test_user@example.com',
+    'unauthorized_test_' || replace(v_attacker_id::text, '-', '') || '@example.com',
     '',
     now(),
     'authenticated',

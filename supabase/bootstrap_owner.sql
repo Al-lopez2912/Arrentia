@@ -1,5 +1,5 @@
 -- ============================================================================
--- ARRENTIA: Authorized Owner Bootstrap Procedure (V6.2)
+-- ARRENTIA: Authorized Owner Bootstrap Procedure (V6.3)
 -- Target Owner: mimelfis.lopez@gmail.com
 -- Idempotent, safe, and checks real auth.users identity without synthetic UUIDs.
 -- ============================================================================

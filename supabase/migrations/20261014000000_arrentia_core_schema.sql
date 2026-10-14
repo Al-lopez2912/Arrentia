@@ -1,92 +1,15 @@
 -- ============================================================================
--- ARRENTIA: Core PostgreSQL / Supabase Schema Migration (Phase A - V6.2)
+-- ARRENTIA: Core PostgreSQL / Supabase Schema Migration (Phase A - V6.3)
 -- Version: 20261014000000
 -- Description: Core 5-table + authorized_owners architecture with strict RLS,
 --              composite foreign keys (tenant/property/owner), canonical payment IDs,
 --              financial immutability triggers, reminder worker isolation, and
 --              anti-probe authorization protection.
+--              Native Supabase migration (uses native auth schema and roles).
 -- ============================================================================
 
--- Ensure pgcrypto extension is available for UUID generation
+-- Ensure pgcrypto extension is available for cryptographic and UUID operations
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
-
--- Ensure standard Supabase roles exist (safely handled for local / CI environments)
-DO $$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
-    CREATE ROLE anon NOLOGIN;
-  END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
-    CREATE ROLE authenticated NOLOGIN;
-  END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
-    CREATE ROLE service_role NOLOGIN;
-  END IF;
-EXCEPTION
-  WHEN duplicate_object OR insufficient_privilege THEN
-    NULL;
-END;
-$$;
-
--- Safely ensure auth schema and auth.users stub exist only if missing (e.g. non-Supabase CI)
-DO $$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'auth') THEN
-    CREATE SCHEMA auth;
-  END IF;
-EXCEPTION
-  WHEN insufficient_privilege OR duplicate_schema THEN
-    NULL;
-END;
-$$;
-
-DO $$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'auth' AND tablename = 'users') THEN
-    CREATE TABLE auth.users (
-      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-      instance_id uuid,
-      email text UNIQUE,
-      encrypted_password text,
-      email_confirmed_at timestamptz,
-      role text DEFAULT 'authenticated',
-      aud text DEFAULT 'authenticated',
-      raw_app_meta_data jsonb DEFAULT '{}'::jsonb,
-      raw_user_meta_data jsonb DEFAULT '{}'::jsonb,
-      created_at timestamptz DEFAULT now(),
-      updated_at timestamptz DEFAULT now()
-    );
-  END IF;
-EXCEPTION
-  WHEN insufficient_privilege OR duplicate_table THEN
-    NULL;
-END;
-$$;
-
--- Ensure auth.uid() helper is present if not already natively defined by Supabase
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_proc p
-    JOIN pg_namespace n ON p.pronamespace = n.oid
-    WHERE n.nspname = 'auth' AND p.proname = 'uid'
-  ) THEN
-    CREATE FUNCTION auth.uid()
-    RETURNS uuid
-    LANGUAGE sql
-    STABLE
-    AS $func$
-      SELECT coalesce(
-        nullif(current_setting('request.jwt.claim.sub', true), ''),
-        ((nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub'))
-      )::uuid;
-    $func$;
-  END IF;
-EXCEPTION
-  WHEN insufficient_privilege OR duplicate_function THEN
-    NULL;
-END;
-$$;
 
 -- ----------------------------------------------------------------------------
 -- 1. Table: authorized_owners
@@ -814,16 +737,17 @@ GRANT SELECT ON public.reminder_logs TO authenticated;
 GRANT EXECUTE ON FUNCTION public.is_authorized_owner(uuid) TO authenticated, service_role;
 REVOKE EXECUTE ON FUNCTION public.is_authorized_owner(uuid) FROM anon, PUBLIC;
 
--- Internal trigger functions: revoke direct execute from anon and PUBLIC
-REVOKE EXECUTE ON FUNCTION public.trg_set_updated_at() FROM anon, PUBLIC;
-REVOKE EXECUTE ON FUNCTION public.trg_tenant_lifecycle() FROM anon, PUBLIC;
-REVOKE EXECUTE ON FUNCTION public.trg_property_lifecycle() FROM anon, PUBLIC;
-REVOKE EXECUTE ON FUNCTION public.trg_payments_enforce_canonical_id() FROM anon, PUBLIC;
-REVOKE EXECUTE ON FUNCTION public.trg_payments_reject_inactive_property() FROM anon, PUBLIC;
-REVOKE EXECUTE ON FUNCTION public.trg_payments_enforce_immutability() FROM anon, PUBLIC;
-REVOKE EXECUTE ON FUNCTION public.trg_settings_enforce_owner_email() FROM anon, PUBLIC;
-REVOKE EXECUTE ON FUNCTION public.trg_sync_owner_email_to_settings() FROM anon, PUBLIC;
-REVOKE EXECUTE ON FUNCTION public.trg_reminder_logs_enforce_owner_recipient() FROM anon, PUBLIC;
+-- Internal trigger functions: revoke direct execute from anon, authenticated, and PUBLIC
+-- This prevents PostgREST from exposing internal triggers as RPC callable endpoints.
+REVOKE EXECUTE ON FUNCTION public.trg_set_updated_at() FROM anon, authenticated, PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.trg_tenant_lifecycle() FROM anon, authenticated, PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.trg_property_lifecycle() FROM anon, authenticated, PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.trg_payments_enforce_canonical_id() FROM anon, authenticated, PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.trg_payments_reject_inactive_property() FROM anon, authenticated, PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.trg_payments_enforce_immutability() FROM anon, authenticated, PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.trg_settings_enforce_owner_email() FROM anon, authenticated, PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.trg_sync_owner_email_to_settings() FROM anon, authenticated, PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.trg_reminder_logs_enforce_owner_recipient() FROM anon, authenticated, PUBLIC;
 
 -- Service role maintains full access for administrative operations and background workers
 GRANT ALL ON TABLE public.authorized_owners TO service_role;
