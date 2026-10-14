@@ -1,5 +1,5 @@
 -- ============================================================================
--- ARRENTIA: Authorized Owner Bootstrap Procedure
+-- ARRENTIA: Authorized Owner Bootstrap Procedure (V6.1)
 -- Target Owner: mimelfis.lopez@gmail.com
 -- Idempotent, safe, and checks real auth.users identity without synthetic UUIDs.
 -- ============================================================================
@@ -7,10 +7,14 @@
 DO $$
 DECLARE
   v_target_email CONSTANT text := 'mimelfis.lopez@gmail.com';
+  v_test_account_email CONSTANT text := 'erickfeliz2026startup@gmail.com';
   v_user_id uuid;
   v_user_email text;
   v_full_name text;
 BEGIN
+  -- Set explicit search path for execution security
+  PERFORM set_config('search_path', 'public, auth, pg_temp', true);
+
   -- 1. Query the actual verified UUID from auth.users
   SELECT
     id,
@@ -22,7 +26,7 @@ BEGIN
     )
   INTO v_user_id, v_user_email, v_full_name
   FROM auth.users
-  WHERE lower(email) = lower(v_target_email);
+  WHERE lower(trim(email)) = lower(trim(v_target_email));
 
   -- 2. Verify that the user exists in Supabase Auth
   IF v_user_id IS NULL THEN
@@ -34,7 +38,19 @@ BEGIN
       USING ERRCODE = 'no_data_found';
   END IF;
 
-  -- 3. Register or activate the user in public.authorized_owners
+  -- 3. Revoke/deactivate temporary test accounts to ensure single-owner invariant
+  UPDATE public.authorized_owners
+  SET is_active = false,
+      updated_at = now()
+  WHERE lower(trim(email)) = lower(trim(v_test_account_email))
+     OR (lower(trim(email)) <> lower(trim(v_target_email)) AND is_active = true);
+
+  -- 4. Clean up any obsolete record with the target email but obsolete UUID
+  DELETE FROM public.authorized_owners
+  WHERE lower(trim(email)) = lower(trim(v_target_email))
+    AND id <> v_user_id;
+
+  -- 5. Register or activate the legitimate owner in public.authorized_owners
   INSERT INTO public.authorized_owners (
     id,
     email,
@@ -44,7 +60,7 @@ BEGIN
   )
   VALUES (
     v_user_id,
-    lower(v_user_email),
+    lower(trim(v_user_email)),
     v_full_name,
     true,
     now()
@@ -56,7 +72,7 @@ BEGIN
     is_active = true,
     updated_at = now();
 
-  -- 4. Idempotently initialize the default owner settings
+  -- 6. Idempotently initialize the default owner settings
   INSERT INTO public.settings (
     owner_id,
     notification_email,
@@ -67,7 +83,7 @@ BEGIN
   )
   VALUES (
     v_user_id,
-    lower(v_user_email),
+    lower(trim(v_user_email)),
     8,
     'America/Santo_Domingo',
     false,

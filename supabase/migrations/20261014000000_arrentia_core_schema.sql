@@ -1,12 +1,56 @@
 -- ============================================================================
--- ARRENTIA: Core PostgreSQL / Supabase Schema Migration (Phase A)
+-- ARRENTIA: Core PostgreSQL / Supabase Schema Migration (Phase A - V6.1)
 -- Version: 20261014000000
 -- Description: Core 5-table + authorized_owners architecture with strict RLS,
---              canonical payment IDs, composite foreign keys, and reminder isolation.
+--              composite foreign keys (tenant/property/owner), canonical payment IDs,
+--              financial immutability triggers, and reminder worker isolation.
 -- ============================================================================
 
 -- Ensure pgcrypto extension is available for UUID generation
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- Ensure standard Supabase roles exist (supports local / CI PostgreSQL instances)
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    CREATE ROLE anon NOLOGIN;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    CREATE ROLE authenticated NOLOGIN;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+    CREATE ROLE service_role NOLOGIN;
+  END IF;
+END;
+$$;
+
+-- Ensure auth schema and auth.users stub exist if running in non-Supabase CI
+CREATE SCHEMA IF NOT EXISTS auth;
+CREATE TABLE IF NOT EXISTS auth.users (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  instance_id uuid,
+  email text UNIQUE,
+  encrypted_password text,
+  email_confirmed_at timestamptz,
+  role text DEFAULT 'authenticated',
+  aud text DEFAULT 'authenticated',
+  raw_app_meta_data jsonb DEFAULT '{}'::jsonb,
+  raw_user_meta_data jsonb DEFAULT '{}'::jsonb,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+
+-- Ensure auth.uid() helper is present
+CREATE OR REPLACE FUNCTION auth.uid()
+RETURNS uuid
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT coalesce(
+    nullif(current_setting('request.jwt.claim.sub', true), ''),
+    ((nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub'))
+  )::uuid;
+$$;
 
 -- ----------------------------------------------------------------------------
 -- 1. Table: authorized_owners
@@ -19,7 +63,8 @@ CREATE TABLE IF NOT EXISTS public.authorized_owners (
   full_name text,
   is_active boolean NOT NULL DEFAULT true,
   created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now()
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT authorized_owners_email_lowercase CHECK (email = lower(trim(email)))
 );
 
 COMMENT ON TABLE public.authorized_owners IS 'Administrative authorization registry linked to verified Supabase Auth users.';
@@ -27,8 +72,9 @@ COMMENT ON TABLE public.authorized_owners IS 'Administrative authorization regis
 -- ----------------------------------------------------------------------------
 -- 2. Authorization Helper Function: is_authorized_owner
 -- Checks whether a given user UUID is an active authorized owner.
+-- Hardened against user probing: authenticated clients can only check their own UID.
 -- ----------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION public.is_authorized_owner(p_user_id uuid)
+CREATE OR REPLACE FUNCTION public.is_authorized_owner(p_user_id uuid DEFAULT auth.uid())
 RETURNS boolean
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -37,6 +83,11 @@ SET search_path = public, pg_temp
 AS $$
 BEGIN
   IF p_user_id IS NULL THEN
+    RETURN false;
+  END IF;
+
+  -- Anti-probe safeguard: authenticated browser clients can only inspect their own authorization
+  IF current_user = 'authenticated' AND p_user_id IS DISTINCT FROM auth.uid() THEN
     RETURN false;
   END IF;
 
@@ -58,6 +109,7 @@ COMMENT ON FUNCTION public.is_authorized_owner(uuid) IS 'Evaluates whether a use
 CREATE OR REPLACE FUNCTION public.trg_set_updated_at()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = public, pg_temp
 AS $$
 BEGIN
   NEW.updated_at = now();
@@ -72,11 +124,11 @@ $$;
 CREATE TABLE IF NOT EXISTS public.properties (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   owner_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-  name text NOT NULL,
-  address text NOT NULL,
-  monthly_rent_amount integer NOT NULL CHECK (monthly_rent_amount >= 0),
+  name text NOT NULL CHECK (char_length(trim(name)) >= 1 AND char_length(name) <= 120),
+  address text NOT NULL CHECK (char_length(trim(address)) >= 1 AND char_length(address) <= 255),
+  monthly_rent_amount integer NOT NULL CHECK (monthly_rent_amount > 0),
   due_day smallint NOT NULL CHECK (due_day >= 1 AND due_day <= 31),
-  tenant_id uuid, -- FK added after tenants table creation
+  tenant_id uuid, -- Composite FK added after tenants table creation
   lease_start_date date NOT NULL,
   lease_end_date date,
   active boolean NOT NULL DEFAULT true,
@@ -97,16 +149,18 @@ CREATE INDEX IF NOT EXISTS idx_properties_active ON public.properties (active);
 CREATE TABLE IF NOT EXISTS public.tenants (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   owner_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-  full_name text NOT NULL,
-  phone text NOT NULL,
+  full_name text NOT NULL CHECK (char_length(trim(full_name)) >= 2 AND char_length(full_name) <= 120),
+  phone text NOT NULL CHECK (char_length(trim(phone)) >= 7 AND char_length(phone) <= 30),
   email text,
-  property_id uuid REFERENCES public.properties(id) ON DELETE SET NULL,
+  property_id uuid,
   notes text,
   active boolean NOT NULL DEFAULT true,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT tenants_id_owner_id_key UNIQUE (id, owner_id),
-  CONSTRAINT fk_tenants_owner_authorized FOREIGN KEY (owner_id) REFERENCES public.authorized_owners(id) ON DELETE CASCADE
+  CONSTRAINT fk_tenants_owner_authorized FOREIGN KEY (owner_id) REFERENCES public.authorized_owners(id) ON DELETE CASCADE,
+  CONSTRAINT fk_tenants_property FOREIGN KEY (property_id, owner_id) REFERENCES public.properties(id, owner_id) ON DELETE SET NULL,
+  CONSTRAINT tenants_active_property_check CHECK (active = true OR property_id IS NULL)
 );
 
 CREATE INDEX IF NOT EXISTS idx_tenants_owner_id ON public.tenants (owner_id);
@@ -117,7 +171,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_active_property
 ON public.tenants (property_id)
 WHERE active = true AND property_id IS NOT NULL;
 
--- Add foreign key from properties.tenant_id referencing tenants(id, owner_id)
+-- Composite foreign key from properties.tenant_id referencing tenants(id, owner_id)
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -134,7 +188,8 @@ $$;
 
 -- ----------------------------------------------------------------------------
 -- 6. Tenant Lifecycle Trigger
--- Deactivating a tenant unassigns the property without deleting historical records.
+-- Deactivating a tenant safely unassigns the property without deleting historical records.
+-- Avoids unassigned OLD record access during INSERT operations.
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.trg_tenant_lifecycle()
 RETURNS TRIGGER
@@ -143,21 +198,24 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 BEGIN
-  -- When a tenant is deactivated, clear property binding on tenant
-  IF NEW.active = false AND OLD.active = true THEN
-    NEW.property_id := NULL;
+  IF TG_OP = 'UPDATE' THEN
+    -- When a tenant is deactivated, clear property binding on tenant and property
+    IF NEW.active = false AND OLD.active = true THEN
+      NEW.property_id := NULL;
 
-    -- Also clear tenant_id on the assigned property
-    UPDATE public.properties
-    SET tenant_id = NULL,
-        updated_at = now()
-    WHERE tenant_id = OLD.id
-      AND owner_id = OLD.owner_id;
-  END IF;
-
-  -- If inserted as inactive, ensure property_id is null
-  IF TG_OP = 'INSERT' AND NEW.active = false AND NEW.property_id IS NOT NULL THEN
-    NEW.property_id := NULL;
+      UPDATE public.properties
+      SET tenant_id = NULL,
+          updated_at = now()
+      WHERE (tenant_id = OLD.id OR id = OLD.property_id)
+        AND owner_id = OLD.owner_id;
+    ELSIF NEW.active = false AND NEW.property_id IS NOT NULL THEN
+      NEW.property_id := NULL;
+    END IF;
+  ELSIF TG_OP = 'INSERT' THEN
+    -- If inserted as inactive, property_id must remain null
+    IF NEW.active = false THEN
+      NEW.property_id := NULL;
+    END IF;
   END IF;
 
   RETURN NEW;
@@ -166,14 +224,48 @@ $$;
 
 DROP TRIGGER IF EXISTS trg_tenants_lifecycle ON public.tenants;
 CREATE TRIGGER trg_tenants_lifecycle
-BEFORE INSERT OR UPDATE OF active ON public.tenants
+BEFORE INSERT OR UPDATE ON public.tenants
 FOR EACH ROW
 EXECUTE FUNCTION public.trg_tenant_lifecycle();
 
 -- ----------------------------------------------------------------------------
+-- 6.1 Property Lifecycle Trigger
+-- Archiving a property safely clears active tenant assignment while preserving historical records.
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.trg_property_lifecycle()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  IF TG_OP = 'UPDATE' AND NEW.active = false AND OLD.active = true THEN
+    NEW.tenant_id := NULL;
+
+    IF OLD.tenant_id IS NOT NULL THEN
+      UPDATE public.tenants
+      SET property_id = NULL,
+          updated_at = now()
+      WHERE id = OLD.tenant_id AND owner_id = OLD.owner_id;
+    END IF;
+  ELSIF TG_OP = 'INSERT' AND NEW.active = false THEN
+    NEW.tenant_id := NULL;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_properties_lifecycle ON public.properties;
+CREATE TRIGGER trg_properties_lifecycle
+BEFORE INSERT OR UPDATE OF active ON public.properties
+FOR EACH ROW
+EXECUTE FUNCTION public.trg_property_lifecycle();
+
+-- ----------------------------------------------------------------------------
 -- 7. Table: payments
 -- Monthly payment tracking per property and period (YYYY-MM).
--- Canonical ID: property_id::text || '_' || period.
+-- Canonical ID format: property_id::text || '_' || period.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.payments (
   id text PRIMARY KEY,
@@ -181,7 +273,7 @@ CREATE TABLE IF NOT EXISTS public.payments (
   property_id uuid NOT NULL,
   tenant_id uuid,
   period varchar(7) NOT NULL CHECK (period ~ '^[0-9]{4}-(0[1-9]|1[0-2])$'),
-  amount_due integer NOT NULL CHECK (amount_due >= 0),
+  amount_due integer NOT NULL CHECK (amount_due > 0),
   due_date date NOT NULL,
   status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'paid')),
   paid_at timestamptz,
@@ -189,6 +281,8 @@ CREATE TABLE IF NOT EXISTS public.payments (
   updated_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT payments_property_period_key UNIQUE (property_id, period),
   CONSTRAINT payments_canonical_id_check CHECK (id = (property_id::text || '_' || period)),
+  CONSTRAINT payments_due_date_period_match CHECK (to_char(due_date, 'YYYY-MM') = period),
+  CONSTRAINT fk_payments_owner_authorized FOREIGN KEY (owner_id) REFERENCES public.authorized_owners(id) ON DELETE CASCADE,
   CONSTRAINT fk_payments_property_owner FOREIGN KEY (property_id, owner_id) REFERENCES public.properties(id, owner_id) ON DELETE RESTRICT,
   CONSTRAINT fk_payments_tenant_owner FOREIGN KEY (tenant_id, owner_id) REFERENCES public.tenants(id, owner_id) ON DELETE SET NULL,
   CONSTRAINT payments_paid_status_check CHECK (
@@ -206,9 +300,10 @@ CREATE INDEX IF NOT EXISTS idx_payments_due_date ON public.payments (due_date);
 CREATE OR REPLACE FUNCTION public.trg_payments_enforce_canonical_id()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = public, pg_temp
 AS $$
 BEGIN
-  IF NEW.id IS NULL OR NEW.id = '' THEN
+  IF NEW.id IS NULL OR trim(NEW.id) = '' THEN
     NEW.id := NEW.property_id::text || '_' || NEW.period;
   END IF;
 
@@ -238,18 +333,20 @@ AS $$
 DECLARE
   v_property_active boolean;
 BEGIN
-  SELECT active INTO v_property_active
-  FROM public.properties
-  WHERE id = NEW.property_id;
+  IF TG_OP = 'INSERT' OR (TG_OP = 'UPDATE' AND NEW.property_id <> OLD.property_id) THEN
+    SELECT active INTO v_property_active
+    FROM public.properties
+    WHERE id = NEW.property_id;
 
-  IF v_property_active IS NULL THEN
-    RAISE EXCEPTION 'Property % does not exist', NEW.property_id
-      USING ERRCODE = 'foreign_key_violation';
-  END IF;
+    IF v_property_active IS NULL THEN
+      RAISE EXCEPTION 'Property % does not exist', NEW.property_id
+        USING ERRCODE = 'foreign_key_violation';
+    END IF;
 
-  IF v_property_active = false THEN
-    RAISE EXCEPTION 'Cannot create payment for inactive property %', NEW.property_id
-      USING ERRCODE = 'check_violation';
+    IF v_property_active = false THEN
+      RAISE EXCEPTION 'Cannot create payment for inactive property %', NEW.property_id
+        USING ERRCODE = 'check_violation';
+    END IF;
   END IF;
 
   RETURN NEW;
@@ -261,6 +358,53 @@ CREATE TRIGGER trg_payments_check_active_property
 BEFORE INSERT OR UPDATE OF property_id ON public.payments
 FOR EACH ROW
 EXECUTE FUNCTION public.trg_payments_reject_inactive_property();
+
+-- Payment Financial Immutability & State Transition Protection (Security Spec Payloads 7 & 8)
+CREATE OR REPLACE FUNCTION public.trg_payments_enforce_immutability()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  -- 1. Structural fields cannot be mutated on update
+  IF NEW.id <> OLD.id OR NEW.owner_id <> OLD.owner_id OR NEW.property_id <> OLD.property_id OR NEW.period <> OLD.period THEN
+    RAISE EXCEPTION 'Cannot modify immutable payment identity fields (id, owner_id, property_id, period)'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  -- 2. State transition protection: cannot revert from 'paid' back to 'pending'
+  IF OLD.status = 'paid' AND NEW.status <> 'paid' THEN
+    RAISE EXCEPTION 'Illegal state transition: paid payments cannot be reverted to pending'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  -- 3. Immutability of paid payments: financial amount, due date, paid_at and tenant cannot be altered
+  IF OLD.status = 'paid' THEN
+    IF NEW.amount_due <> OLD.amount_due OR
+       NEW.due_date <> OLD.due_date OR
+       NEW.paid_at IS DISTINCT FROM OLD.paid_at OR
+       NEW.tenant_id IS DISTINCT FROM OLD.tenant_id THEN
+      RAISE EXCEPTION 'Paid payments are immutable and cannot be modified'
+        USING ERRCODE = 'check_violation';
+    END IF;
+  END IF;
+
+  -- 4. When marking as paid, ensure paid_at is populated
+  IF OLD.status = 'pending' AND NEW.status = 'paid' THEN
+    IF NEW.paid_at IS NULL THEN
+      NEW.paid_at := now();
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_payments_immutability ON public.payments;
+CREATE TRIGGER trg_payments_immutability
+BEFORE UPDATE ON public.payments
+FOR EACH ROW
+EXECUTE FUNCTION public.trg_payments_enforce_immutability();
 
 -- ----------------------------------------------------------------------------
 -- 8. Table: settings
@@ -288,6 +432,11 @@ AS $$
 DECLARE
   v_owner_email text;
 BEGIN
+  IF TG_OP = 'UPDATE' AND NEW.owner_id <> OLD.owner_id THEN
+    RAISE EXCEPTION 'Cannot modify owner_id on settings'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
   SELECT email INTO v_owner_email
   FROM public.authorized_owners
   WHERE id = NEW.owner_id AND is_active = true;
@@ -315,6 +464,30 @@ BEFORE INSERT OR UPDATE OF owner_id, notification_email ON public.settings
 FOR EACH ROW
 EXECUTE FUNCTION public.trg_settings_enforce_owner_email();
 
+-- Synchronize email changes on authorized_owners to settings
+CREATE OR REPLACE FUNCTION public.trg_sync_owner_email_to_settings()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  IF NEW.email <> OLD.email THEN
+    UPDATE public.settings
+    SET notification_email = NEW.email,
+        updated_at = now()
+    WHERE owner_id = NEW.id;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_authorized_owners_sync_settings ON public.authorized_owners;
+CREATE TRIGGER trg_authorized_owners_sync_settings
+AFTER UPDATE OF email ON public.authorized_owners
+FOR EACH ROW
+EXECUTE FUNCTION public.trg_sync_owner_email_to_settings();
+
 -- ----------------------------------------------------------------------------
 -- 9. Table: reminder_logs
 -- Audit log of sent reminder emails. Written exclusively by backend/worker.
@@ -325,7 +498,7 @@ CREATE TABLE IF NOT EXISTS public.reminder_logs (
   payment_id text NOT NULL REFERENCES public.payments(id) ON DELETE CASCADE,
   property_id uuid NOT NULL REFERENCES public.properties(id) ON DELETE CASCADE,
   period varchar(7) NOT NULL CHECK (period ~ '^[0-9]{4}-(0[1-9]|1[0-2])$'),
-  recipient text NOT NULL,
+  recipient text NOT NULL CONSTRAINT reminder_logs_recipient_format CHECK (recipient ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'),
   scheduled_for date NOT NULL,
   status text NOT NULL DEFAULT 'processing' CHECK (status IN ('processing', 'sent', 'failed')),
   provider_message_id text,
@@ -393,7 +566,6 @@ TO authenticated
 USING (id = auth.uid());
 
 -- 11.2 properties policies:
--- Full tenant/property management for authorized owner; soft delete only.
 DROP POLICY IF EXISTS "properties_select_authorized_owner" ON public.properties;
 CREATE POLICY "properties_select_authorized_owner"
 ON public.properties
@@ -520,7 +692,7 @@ GRANT SELECT ON public.reminder_logs TO authenticated;
 
 -- Helper function permissions
 GRANT EXECUTE ON FUNCTION public.is_authorized_owner(uuid) TO authenticated, service_role;
-REVOKE EXECUTE ON FUNCTION public.is_authorized_owner(uuid) FROM anon, public;
+REVOKE EXECUTE ON FUNCTION public.is_authorized_owner(uuid) FROM anon, PUBLIC;
 
 -- Service role maintains full access for administrative operations and background workers
 GRANT ALL ON TABLE public.authorized_owners TO service_role;
