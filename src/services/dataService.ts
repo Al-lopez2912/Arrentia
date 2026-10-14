@@ -251,7 +251,7 @@ export async function fetchOwnerSettings(ownerUid: string): Promise<OwnerSetting
     if (!snap.exists()) {
       return {
         ownerUid,
-        notificationEmail: 'erickfeliz2026startup@gmail.com',
+        notificationEmail: 'mimelfis.lopez@gmail.com',
         reminderHour: 8,
         timezone: 'America/Santo_Domingo',
         updatedAt: new Date().toISOString(),
@@ -270,7 +270,7 @@ export async function saveOwnerSettings(ownerUid: string, data: Partial<OwnerSet
     const now = new Date().toISOString();
     const payload = {
       ownerUid,
-      notificationEmail: data.notificationEmail || 'erickfeliz2026startup@gmail.com',
+      notificationEmail: data.notificationEmail || 'mimelfis.lopez@gmail.com',
       reminderHour: data.reminderHour ?? 8,
       timezone: data.timezone || 'America/Santo_Domingo',
       updatedAt: now,

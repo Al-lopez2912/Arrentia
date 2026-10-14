@@ -37,7 +37,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onRefresh,
 }) => {
   const [notificationEmail, setNotificationEmail] = useState(
-    settings?.notificationEmail || 'erickfeliz2026startup@gmail.com'
+    settings?.notificationEmail || 'mimelfis.lopez@gmail.com'
   );
   const [reminderHour] = useState(settings?.reminderHour || 8);
   const [isSaving, setIsSaving] = useState(false);
