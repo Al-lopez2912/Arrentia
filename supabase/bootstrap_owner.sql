@@ -1,7 +1,8 @@
 -- ============================================================================
--- ARRENTIA: Authorized Owner Bootstrap Procedure (V6.5)
+-- ARRENTIA: Authorized Owner Bootstrap Procedure (V6.6)
 -- Target Owner: mimelfis.lopez@gmail.com
 -- Idempotent, safe, and checks real auth.users identity without synthetic UUIDs.
+-- Enforces historical preservation without destructive DELETE operations.
 -- ============================================================================
 
 DO $$
@@ -80,8 +81,10 @@ BEGIN
     is_active = true,
     updated_at = now();
 
-  -- 6. Safely remove superseded obsolete owner rows
-  DELETE FROM public.authorized_owners
+  -- 6. Safely deactivate superseded records (no hard DELETE to preserve accounting history and avoid FK conflicts)
+  UPDATE public.authorized_owners
+  SET is_active = false,
+      updated_at = now()
   WHERE email LIKE 'superseded_%' AND id <> v_user_id;
 
   -- 7. Idempotently initialize default owner settings

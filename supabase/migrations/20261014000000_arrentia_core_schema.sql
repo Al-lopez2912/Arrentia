@@ -1,10 +1,10 @@
 -- ============================================================================
--- ARRENTIA: Core PostgreSQL / Supabase Schema Migration (Phase A - V6.5)
+-- ARRENTIA: Core PostgreSQL / Supabase Schema Migration (Phase A - V6.6)
 -- Version: 20261014000000
--- Description: Core 5-table + authorized_owners architecture with strict RLS,
---              financial integrity, idempotent server-side payment generation,
---              composite foreign keys (ON DELETE RESTRICT), and concurrency-safe
---              reminder worker queues with lease fencing.
+-- Description: Core schema with strict ON DELETE RESTRICT on historical records,
+--              anti-forgery payments architecture (no direct client INSERT),
+--              server-authoritative timestamps, search_path = pg_catalog on all
+--              SECURITY DEFINER functions, and fenced reminder worker leases.
 -- ============================================================================
 
 -- ----------------------------------------------------------------------------
@@ -21,7 +21,7 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 CREATE OR REPLACE FUNCTION public.trg_set_updated_at()
 RETURNS TRIGGER
 LANGUAGE plpgsql
-SET search_path = public, pg_temp
+SET search_path = pg_catalog
 AS $$
 BEGIN
   NEW.updated_at = now();
@@ -31,13 +31,13 @@ $$;
 
 -- Function: is_authorized_owner
 -- Validates if a user is an active authorized owner.
--- Uses SECURITY DEFINER to bypass RLS recursion on public.authorized_owners.
+-- Uses SECURITY DEFINER with search_path = pg_catalog to prevent search path hijacking.
 CREATE OR REPLACE FUNCTION public.is_authorized_owner(p_user_id uuid)
 RETURNS boolean
 LANGUAGE sql
 SECURITY DEFINER
 STABLE
-SET search_path = public, pg_temp
+SET search_path = pg_catalog
 AS $$
   SELECT EXISTS (
     SELECT 1
@@ -50,10 +50,10 @@ $$;
 -- ----------------------------------------------------------------------------
 -- 3. Table: authorized_owners
 -- Single source of truth for administrative and ownership access.
--- Directly references auth.users(id).
+-- References auth.users(id) with ON DELETE RESTRICT to protect accounting history.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.authorized_owners (
-  id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE RESTRICT,
   email text NOT NULL UNIQUE CHECK (email ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'),
   full_name text NOT NULL CHECK (char_length(trim(full_name)) >= 2 AND char_length(full_name) <= 120),
   is_active boolean NOT NULL DEFAULT true,
@@ -69,10 +69,9 @@ CREATE OR REPLACE FUNCTION public.trg_protect_authorized_owners()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = pg_catalog
 AS $$
 BEGIN
-  -- Disallow regular authenticated users from inserting/updating authorized_owners directly
   IF current_user IN ('anon', 'authenticated') THEN
     RAISE EXCEPTION 'Unauthorized: Management of authorized_owners is restricted to administrative procedures'
       USING ERRCODE = 'insufficient_privilege';
@@ -90,10 +89,11 @@ EXECUTE FUNCTION public.trg_protect_authorized_owners();
 -- ----------------------------------------------------------------------------
 -- 4. Table: properties
 -- Rental properties owned by the authorized owner.
+-- Uses ON DELETE RESTRICT to prevent catastrophic historical cascade.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.properties (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  owner_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  owner_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
   name text NOT NULL CHECK (char_length(trim(name)) >= 1 AND char_length(name) <= 120),
   address text NOT NULL CHECK (char_length(trim(address)) >= 1 AND char_length(address) <= 255),
   monthly_rent_amount integer NOT NULL CHECK (monthly_rent_amount > 0),
@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS public.properties (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT properties_id_owner_id_key UNIQUE (id, owner_id),
-  CONSTRAINT fk_properties_owner_authorized FOREIGN KEY (owner_id) REFERENCES public.authorized_owners(id) ON DELETE CASCADE,
+  CONSTRAINT fk_properties_owner_authorized FOREIGN KEY (owner_id) REFERENCES public.authorized_owners(id) ON DELETE RESTRICT,
   CONSTRAINT properties_lease_dates_check CHECK (lease_end_date IS NULL OR lease_end_date >= lease_start_date)
 );
 
@@ -115,10 +115,11 @@ CREATE INDEX IF NOT EXISTS idx_properties_active ON public.properties (active);
 -- ----------------------------------------------------------------------------
 -- 5. Table: tenants
 -- Tenants associated with properties.
+-- Uses ON DELETE RESTRICT to prevent historical data loss.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.tenants (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  owner_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  owner_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
   full_name text NOT NULL CHECK (char_length(trim(full_name)) >= 2 AND char_length(full_name) <= 120),
   phone text NOT NULL CHECK (char_length(trim(phone)) >= 7 AND char_length(phone) <= 30),
   email text,
@@ -128,7 +129,7 @@ CREATE TABLE IF NOT EXISTS public.tenants (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT tenants_id_owner_id_key UNIQUE (id, owner_id),
-  CONSTRAINT fk_tenants_owner_authorized FOREIGN KEY (owner_id) REFERENCES public.authorized_owners(id) ON DELETE CASCADE,
+  CONSTRAINT fk_tenants_owner_authorized FOREIGN KEY (owner_id) REFERENCES public.authorized_owners(id) ON DELETE RESTRICT,
   CONSTRAINT fk_tenants_property FOREIGN KEY (property_id, owner_id) REFERENCES public.properties(id, owner_id) ON DELETE RESTRICT,
   CONSTRAINT tenants_active_property_check CHECK (active = true OR property_id IS NULL)
 );
@@ -142,7 +143,6 @@ ON public.tenants (property_id)
 WHERE active = true AND property_id IS NOT NULL;
 
 -- Composite foreign key from properties.tenant_id referencing tenants(id, owner_id)
--- Uses ON DELETE RESTRICT (no ON DELETE SET NULL on composite keys with NOT NULL owner_id)
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -166,11 +166,10 @@ CREATE OR REPLACE FUNCTION public.trg_tenant_lifecycle()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = pg_catalog
 AS $$
 BEGIN
   IF TG_OP = 'UPDATE' THEN
-    -- When a tenant is deactivated, clear property binding on tenant and property
     IF NEW.active = false AND OLD.active = true THEN
       NEW.property_id := NULL;
 
@@ -183,7 +182,6 @@ BEGIN
       NEW.property_id := NULL;
     END IF;
   ELSIF TG_OP = 'INSERT' THEN
-    -- If inserted as inactive, property_id must remain null
     IF NEW.active = false THEN
       NEW.property_id := NULL;
     END IF;
@@ -204,7 +202,7 @@ CREATE OR REPLACE FUNCTION public.trg_property_lifecycle()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = pg_catalog
 AS $$
 BEGIN
   IF TG_OP = 'UPDATE' AND NEW.active = false AND OLD.active = true THEN
@@ -234,11 +232,11 @@ EXECUTE FUNCTION public.trg_property_lifecycle();
 -- 7. Table: payments
 -- Monthly payment tracking per property and period (YYYY-MM).
 -- Canonical ID format: property_id::text || '_' || period.
--- Preserves financial history with ON DELETE RESTRICT on property and tenant.
+-- Preserves financial history with ON DELETE RESTRICT on all foreign keys.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.payments (
   id text PRIMARY KEY,
-  owner_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  owner_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
   property_id uuid NOT NULL,
   tenant_id uuid,
   period varchar(7) NOT NULL CHECK (period ~ '^[0-9]{4}-(0[1-9]|1[0-2])$'),
@@ -251,7 +249,7 @@ CREATE TABLE IF NOT EXISTS public.payments (
   CONSTRAINT payments_property_period_key UNIQUE (property_id, period),
   CONSTRAINT payments_canonical_id_check CHECK (id = (property_id::text || '_' || period)),
   CONSTRAINT payments_due_date_period_match CHECK (to_char(due_date, 'YYYY-MM') = period),
-  CONSTRAINT fk_payments_owner_authorized FOREIGN KEY (owner_id) REFERENCES public.authorized_owners(id) ON DELETE CASCADE,
+  CONSTRAINT fk_payments_owner_authorized FOREIGN KEY (owner_id) REFERENCES public.authorized_owners(id) ON DELETE RESTRICT,
   CONSTRAINT fk_payments_property_owner FOREIGN KEY (property_id, owner_id) REFERENCES public.properties(id, owner_id) ON DELETE RESTRICT,
   CONSTRAINT fk_payments_tenant_owner FOREIGN KEY (tenant_id, owner_id) REFERENCES public.tenants(id, owner_id) ON DELETE RESTRICT,
   CONSTRAINT payments_paid_status_check CHECK (
@@ -269,7 +267,7 @@ CREATE INDEX IF NOT EXISTS idx_payments_due_date ON public.payments (due_date);
 CREATE OR REPLACE FUNCTION public.trg_payments_enforce_canonical_id()
 RETURNS TRIGGER
 LANGUAGE plpgsql
-SET search_path = public, pg_temp
+SET search_path = pg_catalog
 AS $$
 BEGIN
   IF NEW.id IS NULL OR trim(NEW.id) = '' THEN
@@ -297,7 +295,7 @@ CREATE OR REPLACE FUNCTION public.trg_payments_reject_inactive_property()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = pg_catalog
 AS $$
 DECLARE
   v_property_active boolean;
@@ -324,7 +322,6 @@ BEGIN
     END IF;
   END IF;
 
-  -- Validate tenant ownership if tenant_id is specified
   IF NEW.tenant_id IS NOT NULL THEN
     IF NOT EXISTS (
       SELECT 1 FROM public.tenants
@@ -345,20 +342,20 @@ BEFORE INSERT OR UPDATE OF property_id, tenant_id ON public.payments
 FOR EACH ROW
 EXECUTE FUNCTION public.trg_payments_reject_inactive_property();
 
--- Payment Financial Immutability & State Transition Protection (Security Spec Payloads 7 & 8)
+-- Payment Financial Immutability & State Transition Protection (Hardened V6.6)
 CREATE OR REPLACE FUNCTION public.trg_payments_enforce_immutability()
 RETURNS TRIGGER
 LANGUAGE plpgsql
-SET search_path = public, pg_temp
+SET search_path = pg_catalog
 AS $$
 BEGIN
-  -- 1. Structural fields cannot be mutated on update
+  -- 1. Structural identity fields cannot be mutated on update
   IF NEW.id <> OLD.id OR NEW.owner_id <> OLD.owner_id OR NEW.property_id <> OLD.property_id OR NEW.period <> OLD.period THEN
     RAISE EXCEPTION 'Cannot modify immutable payment identity fields (id, owner_id, property_id, period)'
       USING ERRCODE = 'check_violation';
   END IF;
 
-  -- 2. Financial fields cannot be modified once payment is generated (matches firestore.rules immutability)
+  -- 2. Financial fields cannot be modified once payment is generated
   IF NEW.amount_due <> OLD.amount_due THEN
     RAISE EXCEPTION 'Payment amount_due is immutable and cannot be modified'
       USING ERRCODE = 'check_violation';
@@ -375,19 +372,28 @@ BEGIN
       USING ERRCODE = 'check_violation';
   END IF;
 
-  -- 4. Immutability of paid payments: tenant and paid_at cannot be altered once paid
-  IF OLD.status = 'paid' THEN
-    IF NEW.paid_at IS DISTINCT FROM OLD.paid_at OR
-       NEW.tenant_id IS DISTINCT FROM OLD.tenant_id THEN
-      RAISE EXCEPTION 'Paid payments are immutable and cannot be modified'
-        USING ERRCODE = 'check_violation';
-    END IF;
+  -- 4. Reject client attempts to set or modify paid_at while pending
+  IF NEW.status = 'pending' AND NEW.paid_at IS NOT NULL THEN
+    RAISE EXCEPTION 'Cannot set paid_at while payment status is pending; paid_at must remain NULL'
+      USING ERRCODE = 'check_violation';
   END IF;
 
-  -- 5. When marking as paid, ensure paid_at is populated
+  -- 5. Authoritative server timestamp on transition from pending to paid
   IF OLD.status = 'pending' AND NEW.status = 'paid' THEN
-    IF NEW.paid_at IS NULL THEN
-      NEW.paid_at := now();
+    -- Always set paid_at on the server with authoritative clock, ignoring any client-supplied value
+    NEW.paid_at := clock_timestamp();
+  END IF;
+
+  -- 6. Immutability of paid payments: tenant and paid_at cannot be altered once paid
+  IF OLD.status = 'paid' THEN
+    IF NEW.paid_at IS DISTINCT FROM OLD.paid_at THEN
+      RAISE EXCEPTION 'Payment paid_at is immutable and cannot be modified once paid'
+        USING ERRCODE = 'check_violation';
+    END IF;
+
+    IF NEW.tenant_id IS DISTINCT FROM OLD.tenant_id THEN
+      RAISE EXCEPTION 'Payment tenant_id is immutable and cannot be modified once paid'
+        USING ERRCODE = 'check_violation';
     END IF;
   END IF;
 
@@ -415,7 +421,7 @@ CREATE OR REPLACE FUNCTION public.fn_calculate_due_date(
 RETURNS date
 LANGUAGE plpgsql
 IMMUTABLE
-SET search_path = public, pg_temp
+SET search_path = pg_catalog
 AS $$
 DECLARE
   v_month_start date;
@@ -437,7 +443,7 @@ $$;
 
 -- Function: fn_generate_monthly_payments
 -- Server-side, idempotent, concurrency-safe monthly payment generator.
--- Excludes inactive properties.
+-- Hardened against forgery: validates caller ownership and forbids accidental blanket runs.
 CREATE OR REPLACE FUNCTION public.fn_generate_monthly_payments(
   p_period varchar DEFAULT NULL,
   p_owner_id uuid DEFAULT NULL
@@ -445,7 +451,7 @@ CREATE OR REPLACE FUNCTION public.fn_generate_monthly_payments(
 RETURNS integer
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = pg_catalog
 AS $$
 DECLARE
   v_period varchar(7);
@@ -453,8 +459,41 @@ DECLARE
   v_period_end date;
   v_target_owner uuid;
   v_created_count integer := 0;
+  v_caller_uid uuid;
 BEGIN
-  -- Default period to current month in Santo Domingo timezone
+  v_caller_uid := auth.uid();
+
+  -- 1. Authorization & Owner Scope Validation
+  IF v_caller_uid IS NOT NULL THEN
+    -- Authenticated client invocation: strictly restricted to authenticated owner
+    IF NOT public.is_authorized_owner(v_caller_uid) THEN
+      RAISE EXCEPTION 'Access denied: caller % is not an active authorized owner', v_caller_uid
+        USING ERRCODE = 'insufficient_privilege';
+    END IF;
+
+    IF p_owner_id IS NOT NULL AND p_owner_id <> v_caller_uid THEN
+      RAISE EXCEPTION 'Access denied: authenticated owner % cannot generate payments for another owner %',
+        v_caller_uid, p_owner_id
+        USING ERRCODE = 'insufficient_privilege';
+    END IF;
+
+    v_target_owner := v_caller_uid;
+  ELSE
+    -- Service role / administrative invocation: must explicitly specify target owner
+    IF p_owner_id IS NULL THEN
+      RAISE EXCEPTION 'Target p_owner_id is strictly required. Blanket generation across all owners is forbidden'
+        USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    IF NOT public.is_authorized_owner(p_owner_id) THEN
+      RAISE EXCEPTION 'Target owner % is not an active authorized owner', p_owner_id
+        USING ERRCODE = 'foreign_key_violation';
+    END IF;
+
+    v_target_owner := p_owner_id;
+  END IF;
+
+  -- 2. Validate period format (YYYY-MM)
   IF p_period IS NULL OR trim(p_period) = '' THEN
     v_period := to_char(now() AT TIME ZONE 'America/Santo_Domingo', 'YYYY-MM');
   ELSE
@@ -469,18 +508,7 @@ BEGIN
   v_period_start := (v_period || '-01')::date;
   v_period_end := (v_period_start + interval '1 month' - interval '1 day')::date;
 
-  -- Determine authorization scope
-  IF auth.uid() IS NOT NULL THEN
-    IF NOT public.is_authorized_owner(auth.uid()) THEN
-      RAISE EXCEPTION 'Access denied: caller % is not an authorized owner', auth.uid()
-        USING ERRCODE = 'insufficient_privilege';
-    END IF;
-    v_target_owner := auth.uid();
-  ELSE
-    v_target_owner := p_owner_id;
-  END IF;
-
-  -- Idempotently insert payments for active properties with active leases
+  -- 3. Idempotent payment generation from server-calculated values
   WITH inserted AS (
     INSERT INTO public.payments (
       id,
@@ -509,9 +537,9 @@ BEGIN
       now() AS updated_at
     FROM public.properties p
     JOIN public.authorized_owners ao ON ao.id = p.owner_id
-    WHERE p.active = true
+    WHERE p.owner_id = v_target_owner
+      AND p.active = true
       AND ao.is_active = true
-      AND (v_target_owner IS NULL OR p.owner_id = v_target_owner)
       AND p.lease_start_date <= v_period_end
       AND (p.lease_end_date IS NULL OR p.lease_end_date >= v_period_start)
     ON CONFLICT (property_id, period) DO NOTHING
@@ -530,7 +558,7 @@ $$;
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.settings (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  owner_id uuid NOT NULL UNIQUE REFERENCES public.authorized_owners(id) ON DELETE CASCADE,
+  owner_id uuid NOT NULL UNIQUE REFERENCES public.authorized_owners(id) ON DELETE RESTRICT,
   notification_email text NOT NULL,
   reminder_hour smallint NOT NULL DEFAULT 8 CHECK (reminder_hour >= 0 AND reminder_hour <= 23),
   timezone text NOT NULL DEFAULT 'America/Santo_Domingo',
@@ -544,7 +572,7 @@ CREATE OR REPLACE FUNCTION public.trg_settings_enforce_owner_email()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = pg_catalog
 AS $$
 DECLARE
   v_owner_email text;
@@ -586,7 +614,7 @@ CREATE OR REPLACE FUNCTION public.trg_sync_owner_email_to_settings()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = pg_catalog
 AS $$
 BEGIN
   IF NEW.email <> OLD.email THEN
@@ -608,13 +636,13 @@ EXECUTE FUNCTION public.trg_sync_owner_email_to_settings();
 -- ----------------------------------------------------------------------------
 -- 9. Table: reminder_logs
 -- Audit log of sent reminder emails with concurrency control & leasing.
--- Reminders go strictly to the authorized owner, never to tenants.
+-- Reminders go strictly to the authorized owner. ON DELETE RESTRICT on all FKs.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.reminder_logs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  owner_id uuid NOT NULL REFERENCES public.authorized_owners(id) ON DELETE CASCADE,
-  payment_id text NOT NULL REFERENCES public.payments(id) ON DELETE CASCADE,
-  property_id uuid NOT NULL REFERENCES public.properties(id) ON DELETE CASCADE,
+  owner_id uuid NOT NULL REFERENCES public.authorized_owners(id) ON DELETE RESTRICT,
+  payment_id text NOT NULL REFERENCES public.payments(id) ON DELETE RESTRICT,
+  property_id uuid NOT NULL REFERENCES public.properties(id) ON DELETE RESTRICT,
   period varchar(7) NOT NULL CHECK (period ~ '^[0-9]{4}-(0[1-9]|1[0-2])$'),
   recipient text NOT NULL CONSTRAINT reminder_logs_recipient_format CHECK (recipient ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'),
   scheduled_for date NOT NULL,
@@ -639,7 +667,7 @@ CREATE OR REPLACE FUNCTION public.trg_reminder_logs_enforce_owner_recipient()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = pg_catalog
 AS $$
 DECLARE
   v_owner_email text;
@@ -697,14 +725,24 @@ RETURNS TABLE (
 )
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = pg_catalog
 AS $$
 DECLARE
   v_today date;
   v_lease_duration interval;
 BEGIN
+  IF p_batch_size IS NULL OR p_batch_size < 1 OR p_batch_size > 100 THEN
+    RAISE EXCEPTION 'Invalid p_batch_size: %, must be between 1 and 100', p_batch_size
+      USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+
+  IF p_lease_seconds IS NULL OR p_lease_seconds < 30 OR p_lease_seconds > 3600 THEN
+    RAISE EXCEPTION 'Invalid p_lease_seconds: %, must be between 30 and 3600', p_lease_seconds
+      USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+
   v_today := COALESCE(p_target_date, (now() AT TIME ZONE 'America/Santo_Domingo')::date);
-  v_lease_duration := (COALESCE(p_lease_seconds, 300) || ' seconds')::interval;
+  v_lease_duration := (p_lease_seconds || ' seconds')::interval;
 
   RETURN QUERY
   WITH candidate_payments AS (
@@ -735,7 +773,7 @@ BEGIN
         rl.id IS NULL
         OR (
           rl.status <> 'sent'
-          AND (rl.status = 'failed' OR rl.lease_expires_at < now())
+          AND (rl.status = 'failed' OR rl.lease_expires_at <= now())
         )
       )
     ORDER BY p.due_date ASC, p.created_at ASC
@@ -781,9 +819,10 @@ BEGIN
       lease_expires_at = EXCLUDED.lease_expires_at,
       recipient = EXCLUDED.recipient,
       scheduled_for = EXCLUDED.scheduled_for,
+      last_error = NULL,
       updated_at = now()
     WHERE public.reminder_logs.status <> 'sent'
-      AND (public.reminder_logs.status = 'failed' OR public.reminder_logs.lease_expires_at < now())
+      AND (public.reminder_logs.status = 'failed' OR public.reminder_logs.lease_expires_at <= now())
     RETURNING
       id,
       payment_id,
@@ -814,7 +853,7 @@ $$;
 
 -- Function: fn_complete_reminder_job
 -- Idempotently marks a reminder job as sent or failed.
--- Protected by claim_token to prevent expired workers from overwriting fresher state.
+-- Protected by claim_token and strict lease validity (lease_expires_at > now()).
 CREATE OR REPLACE FUNCTION public.fn_complete_reminder_job(
   p_payment_id text,
   p_claim_token uuid,
@@ -825,27 +864,43 @@ CREATE OR REPLACE FUNCTION public.fn_complete_reminder_job(
 RETURNS boolean
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = pg_catalog
 AS $$
 DECLARE
   v_updated_count integer;
+  v_clean_msg_id text;
 BEGIN
   IF p_status NOT IN ('sent', 'failed') THEN
     RAISE EXCEPTION 'Invalid completion status: %, expected "sent" or "failed"', p_status
       USING ERRCODE = 'invalid_parameter_value';
   END IF;
 
+  IF p_status = 'sent' THEN
+    IF p_provider_message_id IS NULL OR trim(p_provider_message_id) = '' THEN
+      RAISE EXCEPTION 'A non-empty provider_message_id is required when status is "sent"'
+        USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    v_clean_msg_id := trim(p_provider_message_id);
+    IF lower(v_clean_msg_id) IN ('ok', 'test', 'dummy', 'resend-ok', 'success', 'none') THEN
+      RAISE EXCEPTION 'Invalid provider_message_id "%": dummy placeholders are prohibited; a valid delivery message ID from the provider is required',
+        v_clean_msg_id
+        USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+  END IF;
+
   UPDATE public.reminder_logs
   SET
     status = p_status,
-    provider_message_id = CASE WHEN p_status = 'sent' THEN COALESCE(p_provider_message_id, 'ok') ELSE NULL END,
-    last_error = CASE WHEN p_status = 'failed' THEN p_error ELSE NULL END,
+    provider_message_id = CASE WHEN p_status = 'sent' THEN v_clean_msg_id ELSE NULL END,
+    last_error = CASE WHEN p_status = 'failed' THEN substr(trim(COALESCE(p_error, 'Delivery failed')), 1, 1000) ELSE NULL END,
     claim_token = NULL,
     lease_expires_at = NULL,
     updated_at = now()
   WHERE payment_id = p_payment_id
     AND claim_token = p_claim_token
-    AND (lease_expires_at >= now() OR status = 'processing');
+    AND lease_expires_at > now()
+    AND status = 'processing';
 
   GET DIAGNOSTICS v_updated_count = ROW_COUNT;
 
@@ -897,7 +952,6 @@ ALTER TABLE public.settings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.reminder_logs ENABLE ROW LEVEL SECURITY;
 
 -- 11.1 authorized_owners policies:
--- Only authenticated user can read their own entry. No client mutations allowed.
 DROP POLICY IF EXISTS "authorized_owners_select_self" ON public.authorized_owners;
 CREATE POLICY "authorized_owners_select_self"
 ON public.authorized_owners
@@ -952,6 +1006,8 @@ USING (owner_id = auth.uid() AND public.is_authorized_owner(auth.uid()))
 WITH CHECK (owner_id = auth.uid() AND public.is_authorized_owner(auth.uid()));
 
 -- 11.4 payments policies:
+-- Authenticated clients can SELECT and UPDATE payments (to mark paid).
+-- DIRECT CLIENT INSERTION IS STRICTLY DENIED (generated via RPC fn_generate_monthly_payments).
 DROP POLICY IF EXISTS "payments_select_authorized_owner" ON public.payments;
 CREATE POLICY "payments_select_authorized_owner"
 ON public.payments
@@ -960,11 +1016,7 @@ TO authenticated
 USING (owner_id = auth.uid() AND public.is_authorized_owner(auth.uid()));
 
 DROP POLICY IF EXISTS "payments_insert_authorized_owner" ON public.payments;
-CREATE POLICY "payments_insert_authorized_owner"
-ON public.payments
-FOR INSERT
-TO authenticated
-WITH CHECK (owner_id = auth.uid() AND public.is_authorized_owner(auth.uid()));
+-- No INSERT policy for authenticated role
 
 DROP POLICY IF EXISTS "payments_update_authorized_owner" ON public.payments;
 CREATE POLICY "payments_update_authorized_owner"
@@ -998,7 +1050,6 @@ USING (owner_id = auth.uid() AND public.is_authorized_owner(auth.uid()))
 WITH CHECK (owner_id = auth.uid() AND public.is_authorized_owner(auth.uid()));
 
 -- 11.6 reminder_logs policies:
--- Authenticated owner can read logs; ONLY backend / service_role can insert/update logs.
 DROP POLICY IF EXISTS "reminder_logs_select_authorized_owner" ON public.reminder_logs;
 CREATE POLICY "reminder_logs_select_authorized_owner"
 ON public.reminder_logs
@@ -1018,16 +1069,17 @@ REVOKE ALL ON TABLE public.settings FROM anon, PUBLIC;
 REVOKE ALL ON TABLE public.reminder_logs FROM anon, PUBLIC;
 
 -- Authenticated clients:
--- Can read authorized_owners to determine role
 GRANT SELECT ON public.authorized_owners TO authenticated;
-
--- Can read and mutate core domain entities (NO DELETE: business soft delete enforced)
 GRANT SELECT, INSERT, UPDATE ON public.properties TO authenticated;
 GRANT SELECT, INSERT, UPDATE ON public.tenants TO authenticated;
-GRANT SELECT, INSERT, UPDATE ON public.payments TO authenticated;
-GRANT SELECT, INSERT, UPDATE ON public.settings TO authenticated;
 
--- Can only read reminder logs (worker generates them via service_role)
+-- Payments: Authenticated clients can SELECT payments and UPDATE (only to mark paid).
+-- DIRECT INSERT AND DELETE ARE STRICTLY REVOKED!
+-- Payments must be generated via public.fn_generate_monthly_payments.
+GRANT SELECT, UPDATE ON public.payments TO authenticated;
+REVOKE INSERT, DELETE ON public.payments FROM authenticated;
+
+GRANT SELECT, INSERT, UPDATE ON public.settings TO authenticated;
 GRANT SELECT ON public.reminder_logs TO authenticated;
 
 -- Helper and RPC function permissions
@@ -1047,7 +1099,6 @@ GRANT EXECUTE ON FUNCTION public.fn_complete_reminder_job(text, uuid, text, text
 REVOKE EXECUTE ON FUNCTION public.fn_complete_reminder_job(text, uuid, text, text, text) FROM anon, authenticated, PUBLIC;
 
 -- Internal trigger functions: revoke direct execute from anon, authenticated, and PUBLIC
--- This prevents PostgREST from exposing internal triggers as RPC callable endpoints.
 REVOKE EXECUTE ON FUNCTION public.trg_set_updated_at() FROM anon, authenticated, PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.trg_protect_authorized_owners() FROM anon, authenticated, PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.trg_tenant_lifecycle() FROM anon, authenticated, PUBLIC;

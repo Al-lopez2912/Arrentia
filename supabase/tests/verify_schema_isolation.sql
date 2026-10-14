@@ -1,5 +1,5 @@
 -- ============================================================================
--- ARRENTIA: Test Suite for Schema Integrity and RLS Isolation (V6.5)
+-- ARRENTIA: Test Suite for Schema Integrity and RLS Isolation (V6.6)
 -- Execution Mode: TRANSACTIONAL VALIDATION WITH AUTOMATIC ROLLBACK
 -- Safe to run in psql / Supabase SQL Editor without persistent side-effects.
 -- ============================================================================
@@ -30,7 +30,7 @@ BEGIN
   PERFORM set_config('search_path', 'public, auth, pg_temp', true);
 
   RAISE NOTICE '============================================================';
-  RAISE NOTICE 'STARTING ARRENTIA SCHEMA AND SECURITY ISOLATION TEST SUITE (V6.5)';
+  RAISE NOTICE 'STARTING ARRENTIA SCHEMA AND SECURITY ISOLATION TEST SUITE (V6.6)';
   RAISE NOTICE '============================================================';
 
   -- --------------------------------------------------------------------------
@@ -59,18 +59,17 @@ BEGIN
       v_owner_id,
       '00000000-0000-0000-0000-000000000000'::uuid,
       v_owner_email,
-      '',
+      'fake_hash',
       now(),
       'authenticated',
       'authenticated',
       '{"provider":"email","providers":["email"]}'::jsonb,
-      '{"full_name": "Mimelfis López"}'::jsonb,
+      '{"full_name":"Mimelfis López"}'::jsonb,
       now(),
       now()
     );
   END IF;
 
-  -- Create unauthorized test attacker user in auth.users with non-colliding email
   v_attacker_id := gen_random_uuid();
   INSERT INTO auth.users (
     id,
@@ -88,30 +87,33 @@ BEGIN
   VALUES (
     v_attacker_id,
     '00000000-0000-0000-0000-000000000000'::uuid,
-    'unauthorized_test_' || replace(v_attacker_id::text, '-', '') || '@example.com',
-    '',
+    'attacker_isolated_v66@test.com',
+    'fake_hash',
     now(),
     'authenticated',
     'authenticated',
     '{"provider":"email","providers":["email"]}'::jsonb,
-    '{"full_name": "Intruder User"}'::jsonb,
+    '{"full_name":"Attacker"}'::jsonb,
     now(),
     now()
   );
 
-  -- Clean up any conflicting records with different UUID for target owner
-  DELETE FROM public.authorized_owners
-  WHERE lower(trim(email)) = lower(trim(v_owner_email)) AND id <> v_owner_id;
+  INSERT INTO public.authorized_owners (
+    id,
+    email,
+    full_name,
+    is_active
+  )
+  VALUES (
+    v_owner_id,
+    v_owner_email,
+    'Mimelfis López',
+    true
+  )
+  ON CONFLICT (id) DO UPDATE
+  SET is_active = true,
+      email = EXCLUDED.email;
 
-  -- Register owner in authorized_owners
-  INSERT INTO public.authorized_owners (id, email, full_name, is_active)
-  VALUES (v_owner_id, v_owner_email, 'Mimelfis López', true)
-  ON CONFLICT (id) DO UPDATE SET is_active = true;
-
-  -- Ensure attacker is NOT in authorized_owners
-  DELETE FROM public.authorized_owners WHERE id = v_attacker_id;
-
-  -- Initialize settings for owner
   INSERT INTO public.settings (
     owner_id,
     notification_email,
@@ -124,13 +126,13 @@ BEGIN
     v_owner_email,
     8,
     'America/Santo_Domingo',
-    false
+    true
   )
   ON CONFLICT (owner_id) DO UPDATE
   SET notification_email = EXCLUDED.notification_email;
 
   -- --------------------------------------------------------------------------
-  -- TEST 1: Authorized Owner Creation of Property and Tenant
+  -- TEST 1: Tenant Assignment & Composite Foreign Key Isolation
   -- --------------------------------------------------------------------------
   INSERT INTO public.properties (
     owner_id,
@@ -143,8 +145,8 @@ BEGIN
   )
   VALUES (
     v_owner_id,
-    'Apartamento 101 — Gazcue',
-    'Calle Moisés García #12',
+    'Apartamento Principal de Prueba',
+    'Av. Sarasota #45, Ensanche Bella Vista',
     35000,
     5,
     DATE '2026-01-01',
@@ -170,17 +172,21 @@ BEGIN
   )
   RETURNING id INTO v_tenant_id;
 
-  -- Link property to tenant
   UPDATE public.properties
   SET tenant_id = v_tenant_id
   WHERE id = v_prop_id;
 
-  RAISE NOTICE 'TEST 1 PASSED: Property % and Tenant % successfully created by authorized owner.',
-    v_prop_id, v_tenant_id;
+  -- Verify consistent assignment
+  SELECT tenant_id INTO v_retrieved_tenant_id
+  FROM public.properties
+  WHERE id = v_prop_id;
 
-  -- --------------------------------------------------------------------------
-  -- TEST 1B: Composite Foreign Key Prevents Cross-Owner Inconsistencies
-  -- --------------------------------------------------------------------------
+  IF v_retrieved_tenant_id <> v_tenant_id THEN
+    RAISE EXCEPTION 'TEST 1A FAILED: Property tenant_id does not match created tenant!';
+  END IF;
+  RAISE NOTICE 'TEST 1A PASSED: Property and tenant successfully linked under authorized owner.';
+
+  -- Reject cross-owner assignment: Attacker cannot assign legitimate owner's property
   BEGIN
     INSERT INTO public.tenants (
       owner_id,
@@ -190,8 +196,8 @@ BEGIN
       active
     )
     VALUES (
-      v_attacker_id,
-      'Inquilino Con Dueño Inconsistente',
+      v_attacker_id, -- Attacker tries to bind to legitimate owner's property
+      'Inquilino Atacante',
       '809-555-9999',
       v_prop_id,
       true
@@ -364,7 +370,7 @@ BEGIN
   -- --------------------------------------------------------------------------
   -- TEST 5: Payment Financial Immutability & State Transitions
   -- --------------------------------------------------------------------------
-  -- 5A: Legitimate transition to 'paid' (resolving type mismatch: status is text)
+  -- 5A: Legitimate transition to 'paid' (status is text; auto-populates paid_at)
   UPDATE public.payments
   SET status = 'paid'
   WHERE id = v_payment_id;
@@ -748,7 +754,7 @@ BEGIN
   PERFORM set_config('request.jwt.claim.role', '', true);
 
   RAISE NOTICE '============================================================';
-  RAISE NOTICE 'ALL ARRENTIA V6.5 INTEGRITY & SECURITY TESTS COMPLETED SUCCESSFULLY';
+  RAISE NOTICE 'ALL ARRENTIA V6.6 INTEGRITY & SECURITY TESTS COMPLETED SUCCESSFULLY';
   RAISE NOTICE '============================================================';
 
 END;
