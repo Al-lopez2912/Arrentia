@@ -1,10 +1,11 @@
 -- ============================================================================
--- ARRENTIA: Core PostgreSQL / Supabase Schema Migration (Phase A - V6.3)
+-- ARRENTIA: Core PostgreSQL / Supabase Schema Migration (Phase A - V6.4)
 -- Version: 20261014000000
 -- Description: Core 5-table + authorized_owners architecture with strict RLS,
---              composite foreign keys (tenant/property/owner), canonical payment IDs,
---              financial immutability triggers, reminder worker isolation, and
---              anti-probe authorization protection.
+--              composite foreign keys (tenant/property/owner) with ON DELETE RESTRICT,
+--              canonical payment IDs, financial immutability triggers,
+--              tenant/property lifecycle decoupling, reminder worker isolation,
+--              and anti-probe authorization protection.
 --              Native Supabase migration (uses native auth schema and roles).
 -- ============================================================================
 
@@ -140,7 +141,7 @@ CREATE TABLE IF NOT EXISTS public.tenants (
   updated_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT tenants_id_owner_id_key UNIQUE (id, owner_id),
   CONSTRAINT fk_tenants_owner_authorized FOREIGN KEY (owner_id) REFERENCES public.authorized_owners(id) ON DELETE CASCADE,
-  CONSTRAINT fk_tenants_property FOREIGN KEY (property_id, owner_id) REFERENCES public.properties(id, owner_id) ON DELETE SET NULL,
+  CONSTRAINT fk_tenants_property FOREIGN KEY (property_id, owner_id) REFERENCES public.properties(id, owner_id) ON DELETE RESTRICT,
   CONSTRAINT tenants_active_property_check CHECK (active = true OR property_id IS NULL)
 );
 
@@ -153,6 +154,7 @@ ON public.tenants (property_id)
 WHERE active = true AND property_id IS NOT NULL;
 
 -- Composite foreign key from properties.tenant_id referencing tenants(id, owner_id)
+-- Uses ON DELETE RESTRICT (no ON DELETE SET NULL on composite keys with NOT NULL owner_id)
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -162,7 +164,7 @@ BEGIN
     ADD CONSTRAINT fk_properties_tenant
     FOREIGN KEY (tenant_id, owner_id)
     REFERENCES public.tenants(id, owner_id)
-    ON DELETE SET NULL;
+    ON DELETE RESTRICT;
   END IF;
 END;
 $$;
@@ -247,6 +249,7 @@ EXECUTE FUNCTION public.trg_property_lifecycle();
 -- 7. Table: payments
 -- Monthly payment tracking per property and period (YYYY-MM).
 -- Canonical ID format: property_id::text || '_' || period.
+-- Preserves financial history with ON DELETE RESTRICT on property and tenant.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.payments (
   id text PRIMARY KEY,

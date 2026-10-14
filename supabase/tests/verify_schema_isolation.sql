@@ -1,5 +1,5 @@
 -- ============================================================================
--- ARRENTIA: Test Suite for Schema Integrity and RLS Isolation (V6.3)
+-- ARRENTIA: Test Suite for Schema Integrity and RLS Isolation (V6.4)
 -- Execution Mode: TRANSACTIONAL VALIDATION WITH AUTOMATIC ROLLBACK
 -- Safe to run in psql / Supabase SQL Editor without persistent side-effects.
 -- ============================================================================
@@ -24,7 +24,7 @@ BEGIN
   PERFORM set_config('search_path', 'public, auth, pg_temp', true);
 
   RAISE NOTICE '============================================================';
-  RAISE NOTICE 'STARTING ARRENTIA SCHEMA AND SECURITY ISOLATION TEST SUITE (V6.3)';
+  RAISE NOTICE 'STARTING ARRENTIA SCHEMA AND SECURITY ISOLATION TEST SUITE (V6.4)';
   RAISE NOTICE '============================================================';
 
   -- --------------------------------------------------------------------------
@@ -94,6 +94,10 @@ BEGIN
     now()
   );
 
+  -- Clean up any conflicting records with different UUID for target owner
+  DELETE FROM public.authorized_owners
+  WHERE lower(trim(email)) = lower(trim(v_owner_email)) AND id <> v_owner_id;
+
   -- Register owner in authorized_owners
   INSERT INTO public.authorized_owners (id, email, full_name, is_active)
   VALUES (v_owner_id, v_owner_email, 'Mimelfis López', true)
@@ -149,6 +153,31 @@ BEGIN
   WHERE id = v_prop_id;
 
   RAISE NOTICE 'TEST 1 PASSED: Property (%) and Tenant (%) created with composite FKs.', v_prop_id, v_tenant_id;
+
+  -- --------------------------------------------------------------------------
+  -- TEST 1B: Composite Foreign Key Integrity (Cross-Owner Rejection)
+  -- --------------------------------------------------------------------------
+  BEGIN
+    INSERT INTO public.tenants (
+      owner_id,
+      full_name,
+      phone,
+      property_id,
+      active
+    )
+    VALUES (
+      v_attacker_id, -- Attacker tries referencing victim's property
+      'Inquilino Con Dueño Inconsistente',
+      '809-555-9999',
+      v_prop_id,
+      true
+    );
+
+    RAISE EXCEPTION 'TEST 1B FAILED: Cross-owner property assignment was accepted by composite FK!';
+  EXCEPTION
+    WHEN foreign_key_violation THEN
+      RAISE NOTICE 'TEST 1B PASSED: Cross-owner property assignment correctly rejected by fk_tenants_property composite FK.';
+  END;
 
   -- --------------------------------------------------------------------------
   -- TEST 2: Reject Second Active Tenant on Same Property
@@ -359,6 +388,18 @@ BEGIN
       RAISE NOTICE 'TEST 5D PASSED: Modifying immutable payment fields rejected by trigger.';
   END;
 
+  -- 5E: Reject altering tenant_id on paid payment
+  BEGIN
+    UPDATE public.payments
+    SET tenant_id = NULL
+    WHERE id = v_payment_id;
+
+    RAISE EXCEPTION 'TEST 5E FAILED: Tenant reference on paid payment was altered!';
+  EXCEPTION
+    WHEN check_violation THEN
+      RAISE NOTICE 'TEST 5E PASSED: Altering tenant_id on paid payment rejected by trigger.';
+  END;
+
   -- --------------------------------------------------------------------------
   -- TEST 6: Tenant Lifecycle (Deactivation Unassigns Property, Preserves Payments)
   -- --------------------------------------------------------------------------
@@ -403,6 +444,16 @@ BEGIN
       NULL; -- Check constraint fired as expected
   END;
 
+  -- 6C: Verify hard DELETE on tenant with payments is blocked by ON DELETE RESTRICT
+  BEGIN
+    DELETE FROM public.tenants WHERE id = v_tenant_id;
+
+    RAISE EXCEPTION 'TEST 6C FAILED: Tenant with payment history was hard deleted!';
+  EXCEPTION
+    WHEN foreign_key_violation THEN
+      RAISE NOTICE 'TEST 6C PASSED: Deleting tenant with payment history blocked by fk_payments_tenant_owner (ON DELETE RESTRICT).';
+  END;
+
   RAISE NOTICE 'TEST 6 PASSED: Tenant deactivated, property unassigned, historical payment preserved intact.';
 
   -- --------------------------------------------------------------------------
@@ -428,6 +479,16 @@ BEGIN
   IF v_count <> 1 THEN
     RAISE EXCEPTION 'TEST 7 FAILED: Historical payments lost after property archival!';
   END IF;
+
+  -- 7B: Verify hard DELETE on property with payments is blocked by ON DELETE RESTRICT
+  BEGIN
+    DELETE FROM public.properties WHERE id = v_prop_id;
+
+    RAISE EXCEPTION 'TEST 7B FAILED: Property with payment history was hard deleted!';
+  EXCEPTION
+    WHEN foreign_key_violation THEN
+      RAISE NOTICE 'TEST 7B PASSED: Deleting property with payment history blocked by fk_payments_property_owner (ON DELETE RESTRICT).';
+  END;
 
   RAISE NOTICE 'TEST 7 PASSED: Property archived, tenant assignment cleared, historical payments preserved.';
 
@@ -552,7 +613,7 @@ BEGIN
   PERFORM set_config('request.jwt.claims', '', true);
 
   RAISE NOTICE '============================================================';
-  RAISE NOTICE 'ALL 10 INTEGRITY AND SECURITY TESTS COMPLETED SUCCESSFULLY!';
+  RAISE NOTICE 'ALL INTEGRITY AND SECURITY TESTS COMPLETED SUCCESSFULLY!';
   RAISE NOTICE '============================================================';
 END;
 $$;

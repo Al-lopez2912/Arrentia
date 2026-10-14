@@ -1,5 +1,5 @@
 -- ============================================================================
--- ARRENTIA: Authorized Owner Bootstrap Procedure (V6.3)
+-- ARRENTIA: Authorized Owner Bootstrap Procedure (V6.4)
 -- Target Owner: mimelfis.lopez@gmail.com
 -- Idempotent, safe, and checks real auth.users identity without synthetic UUIDs.
 -- ============================================================================
@@ -45,24 +45,16 @@ BEGIN
   WHERE lower(trim(email)) = lower(trim(v_test_account_email))
      OR (lower(trim(email)) <> lower(trim(v_target_email)) AND is_active = true);
 
-  -- 4. If an obsolete record exists with the target email but different UUID, migrate data safely
+  -- 4. Displace any obsolete record with the target email but different UUID
+  -- to satisfy the unique email constraint without foreign key violation
   IF EXISTS (
     SELECT 1 FROM public.authorized_owners
     WHERE lower(trim(email)) = lower(trim(v_target_email)) AND id <> v_user_id
   ) THEN
-    UPDATE public.properties SET owner_id = v_user_id WHERE owner_id IN (
-      SELECT id FROM public.authorized_owners WHERE lower(trim(email)) = lower(trim(v_target_email)) AND id <> v_user_id
-    );
-    UPDATE public.tenants SET owner_id = v_user_id WHERE owner_id IN (
-      SELECT id FROM public.authorized_owners WHERE lower(trim(email)) = lower(trim(v_target_email)) AND id <> v_user_id
-    );
-    UPDATE public.payments SET owner_id = v_user_id WHERE owner_id IN (
-      SELECT id FROM public.authorized_owners WHERE lower(trim(email)) = lower(trim(v_target_email)) AND id <> v_user_id
-    );
-    UPDATE public.settings SET owner_id = v_user_id WHERE owner_id IN (
-      SELECT id FROM public.authorized_owners WHERE lower(trim(email)) = lower(trim(v_target_email)) AND id <> v_user_id
-    );
-    DELETE FROM public.authorized_owners
+    UPDATE public.authorized_owners
+    SET email = 'superseded_' || replace(id::text, '-', '') || '_' || lower(trim(v_target_email)),
+        is_active = false,
+        updated_at = now()
     WHERE lower(trim(email)) = lower(trim(v_target_email)) AND id <> v_user_id;
   END IF;
 
@@ -88,7 +80,11 @@ BEGIN
     is_active = true,
     updated_at = now();
 
-  -- 6. Idempotently initialize the default owner settings
+  -- 6. Safely remove superseded obsolete owner rows
+  DELETE FROM public.authorized_owners
+  WHERE email LIKE 'superseded_%' AND id <> v_user_id;
+
+  -- 7. Idempotently initialize default owner settings
   INSERT INTO public.settings (
     owner_id,
     notification_email,
